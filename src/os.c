@@ -104,6 +104,16 @@ int os_random(void *buf, size_t len)
     return 0;
 }
 
+int os_wall_clock(int64_t *sec, uint32_t *nsec)
+{
+    FILETIME ft;
+    GetSystemTimePreciseAsFileTime(&ft); // 100 ns ticks since 1601-01-01 UTC
+    const uint64_t ticks = ((uint64_t)ft.dwHighDateTime << 32 | ft.dwLowDateTime) - 116444736000000000ull;
+    *sec = (int64_t)(ticks / 10000000);
+    *nsec = (uint32_t)(ticks % 10000000) * 100;
+    return 0;
+}
+
 int os_file_map_ro(os_file f, uint64_t size, void **out)
 {
     uint64_t fsize;
@@ -278,13 +288,57 @@ static bool ram_file_range_ok(os_file f, uint64_t foff, size_t len)
            !ckd_add(&fend, foff, (uint64_t)len) && fend <= fsize;
 }
 
+// MapViewOfFile3 and VirtualAlloc2 (Windows 10 1803) are hidden by the headers
+// at the default NTDDI_VERSION, and not every import library exports them.
+// They live in kernelbase.dll, so look them up there: without them, the
+// placeholder calls fail with -1.
+#  ifndef MEM_PRESERVE_PLACEHOLDER
+#    define MEM_PRESERVE_PLACEHOLDER 0x00000002
+#  endif
+#  ifndef MEM_REPLACE_PLACEHOLDER
+#    define MEM_REPLACE_PLACEHOLDER 0x00004000
+#  endif
+#  ifndef MEM_RESERVE_PLACEHOLDER
+#    define MEM_RESERVE_PLACEHOLDER 0x00040000
+#  endif
+typedef PVOID(WINAPI *virtual_alloc2_fn)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void *, ULONG);
+typedef PVOID(WINAPI *map_view_of_file3_fn)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG,
+                                            void *, ULONG);
+
+static FARPROC kernelbase_proc(const char *name)
+{
+    HMODULE m = GetModuleHandleA("kernelbase.dll");
+    return m ? GetProcAddress(m, name) : nullptr;
+}
+
+static virtual_alloc2_fn get_virtual_alloc2(void)
+{
+    union {
+        FARPROC p;
+        virtual_alloc2_fn f;
+    } u = {.p = kernelbase_proc("VirtualAlloc2")};
+    return u.f;
+}
+
+static map_view_of_file3_fn get_map_view_of_file3(void)
+{
+    union {
+        FARPROC p;
+        map_view_of_file3_fn f;
+    } u = {.p = kernelbase_proc("MapViewOfFile3")};
+    return u.f;
+}
+
 // Windows: placeholders let file views and anonymous memory be stitched
 // together inside one contiguous reservation.
 int os_ram_reserve(os_ram *r, size_t size)
 {
     *r = (os_ram){.size = size};
-    r->base = VirtualAlloc2(nullptr, nullptr, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                            PAGE_NOACCESS, nullptr, 0);
+    const virtual_alloc2_fn va2 = get_virtual_alloc2();
+    if (!va2)
+        return -1;
+    r->base = va2(nullptr, nullptr, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+                  nullptr, 0);
     return r->base ? 0 : -1;
 }
 
@@ -293,6 +347,9 @@ int os_ram_map_file(os_ram *r, size_t off, size_t len, os_file f, uint64_t foff)
     size_t slot;
     if (!ram_view_slot(r, off, len, &slot) || !ram_file_range_ok(f, foff, len))
         return -1;
+    const map_view_of_file3_fn mv3 = get_map_view_of_file3();
+    if (!mv3)
+        return -1; // before any placeholder is carved out
     HANDLE sec = CreateFileMappingA((HANDLE)f.h, nullptr, PAGE_WRITECOPY, 0, 0, nullptr);
     if (!sec)
         return -1;
@@ -305,8 +362,8 @@ int os_ram_map_file(os_ram *r, size_t off, size_t len, os_file f, uint64_t foff)
         CloseHandle(sec);
         return -1;
     }
-    void *v = MapViewOfFile3(sec, GetCurrentProcess(), r->base + off, foff, len,
-                             MEM_REPLACE_PLACEHOLDER, PAGE_WRITECOPY, nullptr, 0);
+    void *v = mv3(sec, GetCurrentProcess(), r->base + off, foff, len, MEM_REPLACE_PLACEHOLDER,
+                  PAGE_WRITECOPY, nullptr, 0);
     CloseHandle(sec); // the view keeps the section alive
     if (!v)
         return -1; // the carved-out placeholder stays; os_ram_commit fills it
@@ -324,6 +381,9 @@ int os_ram_commit(os_ram *r)
 {
     // Fill every gap between views, placeholder by placeholder: a gap can
     // hold several adjacent placeholders (splits, failed maps).
+    const virtual_alloc2_fn va2 = get_virtual_alloc2();
+    if (!va2)
+        return -1;
     for (size_t i = 0; i <= r->nviews; i++) {
         size_t lo = i ? r->views[i - 1].off + r->views[i - 1].len : 0;
         const size_t hi = i < r->nviews ? r->views[i].off : r->size;
@@ -335,9 +395,8 @@ int os_ram_commit(os_ram *r)
             if (n > hi - lo)
                 n = hi - lo;
             // Commit only charges the pagefile; pages are still demand-zeroed.
-            if (!VirtualAlloc2(nullptr, r->base + lo, n,
-                               MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
-                               nullptr, 0))
+            if (!va2(nullptr, r->base + lo, n, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                     PAGE_READWRITE, nullptr, 0))
                 return -1;
             lo += n;
         }
@@ -372,6 +431,7 @@ void os_ram_release(os_ram *r)
 #  include <sys/random.h>
 #  include <sys/stat.h>
 #  include <sys/syscall.h>
+#  include <time.h>
 #  include <unistd.h>
 
 static void write_fd(int fd, const void *buf, size_t len)
@@ -463,6 +523,16 @@ int os_random(void *buf, size_t len)
         p += n;
         len -= (size_t)n;
     }
+    return 0;
+}
+
+int os_wall_clock(int64_t *sec, uint32_t *nsec)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts))
+        return -1;
+    *sec = (int64_t)ts.tv_sec;
+    *nsec = (uint32_t)ts.tv_nsec;
     return 0;
 }
 

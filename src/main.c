@@ -618,9 +618,10 @@ int main(int argc, char **argv)
 {
     static vm v; // zero-initialized, off the stack
     v.t_start = mvm_now_ns();
-    struct timespec t0;
-    if (timespec_get(&t0, TIME_UTC) == TIME_UTC)
-        v.start_unix_us = (int64_t)t0.tv_sec * 1000000 + t0.tv_nsec / 1000;
+    int64_t t0_sec = 0;
+    uint32_t t0_nsec = 0;
+    if (!os_wall_clock(&t0_sec, &t0_nsec))
+        v.start_unix_us = t0_sec * 1000000 + t0_nsec / 1000;
 
     const char *kernel = nullptr, *cmdline = DEFAULT_CMDLINE, *append = nullptr;
     bool hello = false, quiet = false, timestamps = false, map_kernel = false, serial_load = false;
@@ -1081,10 +1082,11 @@ int main(int argc, char **argv)
                       (unsigned long long)hinfo.tsc_khz);
     // The wall clock, so the guest needn't read the CMOS RTC (~22 exits),
     // with kernel patch 0012. A stock kernel hands it to init as a variable.
-    struct timespec wall;
-    if (kernel && timespec_get(&wall, TIME_UTC) == TIME_UTC && n > 0 && (size_t)n < sizeof cl)
-        n += snprintf(cl + n, sizeof cl - (size_t)n, " wallclock=%lld.%09ld",
-                      (long long)wall.tv_sec, (long)wall.tv_nsec);
+    int64_t wall_sec = 0;
+    uint32_t wall_nsec = 0;
+    if (kernel && !os_wall_clock(&wall_sec, &wall_nsec) && n > 0 && (size_t)n < sizeof cl)
+        n += snprintf(cl + n, sizeof cl - (size_t)n, " wallclock=%lld.%09ld", (long long)wall_sec,
+                      (long)wall_nsec);
     uint32_t irq_pins = 0;
     for (int i = 0; i < v.nvirtio && n > 0 && (size_t)n + 1 < sizeof cl; i++) {
         cl[n++] = ' ';

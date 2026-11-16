@@ -19,6 +19,9 @@ void os_file_close(os_file f);
 [[nodiscard]] int os_file_pwrite(os_file f, const void *buf, size_t len, uint64_t off);
 // Fill buf from the OS's random number generator; returns 0 on success.
 [[nodiscard]] int os_random(void *buf, size_t len);
+// The wall clock: seconds since the Unix epoch and the nanoseconds within that
+// second. Returns 0, or -1 with *sec and *nsec untouched.
+[[nodiscard]] int os_wall_clock(int64_t *sec, uint32_t *nsec);
 // Map the first `size` bytes of a file read-only and shared: every mapping of
 // the file, in any process, uses the same page-cache pages. size must be a
 // multiple of 4096 and at most the file's size.

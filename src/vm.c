@@ -55,11 +55,12 @@ static void note_unknown(vm *v, uint16_t port, bool write)
 
 static void latch_resume(vm *v)
 {
-    struct timespec ts = {0};
-    (void)timespec_get(&ts, TIME_UTC);
+    int64_t sec = 0;
+    uint32_t nsec = 0;
+    (void)os_wall_clock(&sec, &nsec);
     memset(v->resume, 0, sizeof v->resume);
-    put_le64(v->resume, (uint64_t)(int64_t)ts.tv_sec);
-    put_le32(v->resume + 8, (uint32_t)ts.tv_nsec);
+    put_le64(v->resume, (uint64_t)sec);
+    put_le32(v->resume + 8, nsec);
     put_le32(v->resume + 12, v->restored ? 1 : 0);
     memcpy(v->resume + 16, v->seed, sizeof v->seed);
     v->rd = v->resume, v->rd_len = MVM_RESUME_LEN, v->rd_at = 0;
