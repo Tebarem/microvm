@@ -658,8 +658,9 @@ every device and driver at boot, and a container rarely needs `/sys`:
 glibc counts CPUs from `/proc/stat` without it. So it stays out. Turning
 it back on is one line in `config.fragment`, and `/init` mounts it
 read-only when it is there. The alternatives undo table that patch 0026
-keeps in `__initdata` grew from 48 to 64 KiB for the extra code. It is
-freed after boot.
+keeps in `__initdata` grew from 48 to 512 KiB: KVM's view rewrites far more
+text (a pre-patch there needs 333,392 bytes of undo table, so 64 KiB was
+too small). It is freed after boot.
 
 ### Container image conversion
 

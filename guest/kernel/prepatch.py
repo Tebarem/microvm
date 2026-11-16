@@ -124,7 +124,7 @@ def sort_static_calls(elf, data):
 
 ALT_MAGIC = 0x3148435441505041  # "APPATCH1", kernel patch 0026
 ALT_INPUTS_MAX = 1024
-ALT_UNDO_MAX = 64 << 10
+ALT_UNDO_MAX = 512 << 10  # keep in sync with 0026's #define; KVM's view needs 333392 bytes
 KERNEL_MAP = 0xffffffff80000000  # kernel virtual = physical + this
 
 
