@@ -433,6 +433,33 @@ static pid_t spawn_vm(int cgroup_fd)
     return (pid_t)syscall(SYS_clone3, &ca, sizeof ca);
 }
 
+// One of the new user namespace's id files. EACCES or EPERM here is most
+// likely the AppArmor restriction (kernel.apparmor_restrict_unprivileged_userns,
+// on by default on Ubuntu 24.04): unshare(CLONE_NEWUSER) succeeds, but the
+// namespace gets no capabilities, so these writes are refused.
+static void write_userns_file(const char *path, const char *val)
+{
+    int err = 0;
+    const int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        err = errno;
+    } else {
+        const size_t n = strlen(val);
+        if (write(fd, val, n) != (ssize_t)n)
+            err = errno ? errno : EIO;
+        if (close(fd) && !err)
+            err = errno;
+    }
+    if (!err)
+        return;
+    if (err == EACCES || err == EPERM)
+        die("%s: %s (on Ubuntu this is usually the AppArmor user namespace restriction: "
+            "kernel.apparmor_restrict_unprivileged_userns=1)",
+            path, strerror(err));
+    errno = err;
+    die_errno("write", path);
+}
+
 static void enter_userns(void)
 {
     const uid_t uid = getuid();
@@ -440,11 +467,11 @@ static void enter_userns(void)
     if (unshare(CLONE_NEWUSER))
         die_errno("unshare(CLONE_NEWUSER)", nullptr);
     char map[64];
-    write_file("/proc/self/setgroups", nullptr, "deny");
+    write_userns_file("/proc/self/setgroups", "deny");
     snprintf(map, sizeof map, "%u %u 1", (unsigned)uid, (unsigned)uid);
-    write_file("/proc/self/uid_map", nullptr, map);
+    write_userns_file("/proc/self/uid_map", map);
     snprintf(map, sizeof map, "%u %u 1", (unsigned)gid, (unsigned)gid);
-    write_file("/proc/self/gid_map", nullptr, map);
+    write_userns_file("/proc/self/gid_map", map);
 }
 
 static void mkdirs(char *path) // under NEWROOT, every component we create is ours

@@ -20,6 +20,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "userns.h"
+
 typedef struct {
     const char *jail; // nullptr: run the VMM directly
     const char *vmm, *kernel, *rootfs, *dir;
@@ -104,16 +106,11 @@ static int jw_wrap(const jw_cfg *c, const char *const *args, const char **out, i
     return 0;
 }
 
-// The jail can run here: as root, or with unprivileged user namespaces.
+// The jail can run here: as root, or with user namespaces that work all the
+// way (userns.h: unshare() alone isn't enough on Ubuntu 24.04).
 static bool jw_usable(void)
 {
-    if (geteuid() == 0)
-        return true;
-    const pid_t pid = fork();
-    if (pid == 0)
-        _exit(unshare(CLONE_NEWUSER) ? 1 : 0);
-    int st;
-    return pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    return geteuid() == 0 || userns_usable();
 }
 
 // Takes "--jail JAIL" out of argv (anywhere after argv[0]); returns JAIL or nullptr.
