@@ -43,6 +43,7 @@
 #include <unistd.h>
 
 #include "net_helper.h"
+#include "userns.h"
 
 extern char **environ;
 
@@ -262,15 +263,6 @@ static int run(char *const args[], char *out, size_t outlen, int kill_after_ms)
     return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
 }
 
-static bool userns_works(void)
-{
-    const pid_t pid = fork();
-    if (pid == 0)
-        _exit(unshare(CLONE_NEWUSER) ? 1 : 0);
-    int st;
-    return waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0;
-}
-
 // The jail with the standard binds (and cgroup CG if not ""), running this
 // binary with TAIL.
 static int run_jailed(const char *cg, char *bind_data, char *bind_out, char *const tail[], char *out,
@@ -396,8 +388,22 @@ static void net_checks(const char *cg, const char *uid_s)
         got += (size_t)r;
     fputs(text, stdout);
     printf("outside, with --net:\n");
+    if (!strstr(text, "ready\n")) {
+        // The jail died before the VM was up (its output is above): nothing
+        // will ever connect to the listener, so don't wait for it.
+        check(false, "the jailed --net VM got ready (the jail failed)");
+        close(in[1]);
+        close(out[0]);
+        close(l);
+        kill(pid, SIGKILL);
+        waitpid(pid, nullptr, 0);
+        return;
+    }
     check(strstr(text, "inside: all checks passed") != nullptr, "the jailed --net checks passed");
-    const int c = accept4(l, nullptr, nullptr, SOCK_CLOEXEC);
+    // Bounded: the helper's connection is already queued if its checks passed.
+    struct pollfd lp = {.fd = l, .events = POLLIN};
+    const int ready_conn = poll(&lp, 1, 5000);
+    const int c = ready_conn == 1 ? accept4(l, nullptr, nullptr, SOCK_CLOEXEC) : -1;
     char msg[32] = {0};
     check(c >= 0 && read(c, msg, sizeof msg - 1) == 14 && !strcmp(msg, "via the helper"),
           "the host listener got the bytes");
@@ -504,8 +510,8 @@ int main(int argc, char **argv)
     }
     jail = argv[1];
     root = geteuid() == 0;
-    if (!root && !userns_works()) {
-        printf("skipped: not root and no unprivileged user namespaces\n");
+    if (!root && !userns_usable()) {
+        printf("skipped: not root and no working unprivileged user namespaces\n");
         return 77;
     }
     const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);

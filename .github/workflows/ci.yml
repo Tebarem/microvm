@@ -45,6 +45,15 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
+      # Ubuntu 24.04 restricts unprivileged user namespaces (AppArmor): unshare
+      # (CLONE_NEWUSER) works, but the namespace has no capabilities, so
+      # microvm-jail can't write its id maps and the --jail tests fail or hang.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: Test
         run: ctest --test-dir build --output-on-failure -E '^hello$'
 
@@ -73,6 +82,13 @@ jobs:
 
       - name: Build
         run: cmake --build build --parallel
+
+      # As in the linux job: user namespaces must work for the --jail tests.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
 
       - name: Test
         run: ctest --test-dir build --output-on-failure -E '^hello$'
@@ -229,6 +245,13 @@ jobs:
 
       - name: Build
         run: cmake --build build --parallel
+
+      # As in the linux job: the --jail suites need working user namespaces.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
