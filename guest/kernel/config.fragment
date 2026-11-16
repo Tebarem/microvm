@@ -1,0 +1,157 @@
+# SPDX-License-Identifier: MIT
+# Applied on top of `make tinyconfig`. Every option here costs boot time or
+# memory, so each one has to justify itself.
+
+CONFIG_64BIT=y
+
+# --- console: the microvm console port (0011), no UART driver ---------------
+# "earlyprintk=microvm,keep" writes the log 4 bytes per VM exit. An 8250
+# costs 2 exits per byte, and its driver probes the port at boot (~35 exits).
+CONFIG_PRINTK=y
+CONFIG_EARLY_PRINTK=y
+CONFIG_TTY=y
+# CONFIG_SERIAL_8250 is not set
+# CONFIG_VT is not set
+# CONFIG_SERIO is not set
+# Legacy BSD PTYs register 256 master/slave pairs (512 tty devices) at
+# boot, ~10% of guest boot time. Containers want devpts (Unix98) PTYs,
+# which are allocated on demand.
+# CONFIG_LEGACY_PTYS is not set
+CONFIG_UNIX98_PTYS=y
+# No ISA DMA controller in a microVM; its driver probes for one (an exit).
+# CONFIG_ISA_DMA_API is not set
+
+# --- initramfs built into the image, uncompressed --------------------------
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_INITRAMFS_COMPRESSION_NONE=y
+# CONFIG_RD_GZIP is not set
+# CONFIG_RD_BZIP2 is not set
+# CONFIG_RD_LZMA is not set
+# CONFIG_RD_XZ is not set
+# CONFIG_RD_LZO is not set
+# CONFIG_RD_LZ4 is not set
+# CONFIG_RD_ZSTD is not set
+CONFIG_BINFMT_ELF=y
+
+# --- timekeeping without PIT / HPET / ACPI ---------------------------------
+# TSC + LAPIC-timer frequencies come from the hypervisor (kvmclock on KVM,
+# Hyper-V frequency MSRs on WHP), so nothing is calibrated against a PIT.
+CONFIG_HYPERVISOR_GUEST=y
+CONFIG_PARAVIRT=y
+CONFIG_KVM_GUEST=y
+CONFIG_X86_MPPARSE=y
+# CONFIG_X86_X2APIC is not set
+# CONFIG_HPET_TIMER is not set
+CONFIG_HZ_100=y
+CONFIG_NO_HZ_IDLE=y
+
+# --- guest /init talks to the microvm control port ---------------------------
+CONFIG_X86_IOPL_IOPERM=y
+
+# --- security: keep guest-internal mitigations on ---------------------------
+CONFIG_CPU_MITIGATIONS=y
+# CONFIG_RANDOMIZE_BASE is not set
+
+# --- memory density ----------------------------------------------------------
+# 16 KB printk ring (default 128 KB). A full boot log is ~6 KB of text, and
+# 4 KB already drops messages, which then cost console exits under quiet.
+CONFIG_LOG_BUF_SHIFT=14
+# Call-depth tracking only helps Skylake-era Intel (it falls back to IBRS there)
+# and pads every function by 16 bytes: ~5% bigger text to load and fault in.
+# CONFIG_MITIGATION_CALL_DEPTH_TRACKING is not set
+
+# --- container root filesystem -----------------------------------------------
+# The image is a read-only EROFS file the VMM maps into guest-physical memory
+# and lists in e820 as type 12 (legacy persistent memory): the pmem driver
+# makes it /dev/pmem0. No virtio device, no queue, no interrupt, no device
+# emulation in the VMM; every VM reads the same host page-cache pages.
+CONFIG_BLOCK=y
+CONFIG_BLK_DEV=y
+CONFIG_X86_PMEM_LEGACY=y
+CONFIG_LIBNVDIMM=y
+CONFIG_BLK_DEV_PMEM=y
+# CONFIG_BTT is not set
+CONFIG_MISC_FILESYSTEMS=y
+CONFIG_EROFS_FS=y
+# CONFIG_EROFS_FS_XATTR is not set
+# CONFIG_EROFS_FS_ZIP is not set
+# CONFIG_EROFS_FS_BACKED_BY_FILE is not set
+# pmem is bio-based: no request queue, so no I/O scheduler is ever used (each
+# registers itself at boot). The image is a whole-disk filesystem: no
+# partition table to scan for.
+# CONFIG_MQ_IOSCHED_DEADLINE is not set
+# CONFIG_MQ_IOSCHED_KYBER is not set
+CONFIG_PARTITION_ADVANCED=y
+# CONFIG_MSDOS_PARTITION is not set
+# CONFIG_EFI_PARTITION is not set
+# Nothing may write to a block device while it's mounted.
+# CONFIG_BLK_DEV_WRITE_MOUNTED is not set
+
+# virtio-mmio devices (declared on the command line: virtio_mmio.device=),
+# their interrupts through the VMM's I/O APIC. vsock is the host channel;
+# it needs the core network stack (no INET).
+CONFIG_NET=y
+CONFIG_VSOCKETS=y
+CONFIG_VIRTIO_VSOCKETS=y
+CONFIG_VIRTIO_MENU=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+
+# --- networking: virtio-net, IPv4 ------------------------------------------------
+# The VMM's userspace NAT (src/dev/net.c) is the guest's only peer. The
+# address is static, from the command line (ip=..., IP_PNP; patch 0038 drops
+# its 10 ms settle sleep): no DHCP client, no ARP probing. IPv6 is left out:
+# +233 KB of text and its boot-time init for a path the NAT doesn't serve yet.
+CONFIG_INET=y
+# CONFIG_IPV6 is not set
+# CONFIG_INET_DIAG is not set
+CONFIG_NETDEVICES=y
+CONFIG_NET_CORE=y
+CONFIG_VIRTIO_NET=y
+# Free page reporting (src/dev/balloon.c): memory the guest frees goes back to
+# the host, and out of diff snapshots. The balloon itself never inflates.
+CONFIG_VIRTIO_BALLOON=y
+CONFIG_IP_PNP=y
+
+# --- the userspace ABI container images expect --------------------------------
+# tinyconfig leaves out interfaces nearly every real program uses. Without
+# them glibc's threads (futex), Node and Python asyncio (epoll, eventfd,
+# timerfd), `#!` scripts, setuid() to an image's User, /proc and a writable
+# root (overlayfs + tmpfs) all fail. BENCH.md has their boot and memory cost.
+CONFIG_MULTIUSER=y
+CONFIG_FUTEX=y
+CONFIG_EPOLL=y
+CONFIG_SIGNALFD=y
+CONFIG_TIMERFD=y
+CONFIG_EVENTFD=y
+CONFIG_POSIX_TIMERS=y
+CONFIG_ADVISE_SYSCALLS=y
+CONFIG_MEMBARRIER=y
+CONFIG_RSEQ=y
+CONFIG_FILE_LOCKING=y
+CONFIG_INOTIFY_USER=y
+CONFIG_SYSVIPC=y
+CONFIG_BINFMT_SCRIPT=y
+CONFIG_UNIX=y
+CONFIG_SHMEM=y
+CONFIG_TMPFS=y
+CONFIG_TMPFS_XATTR=y
+CONFIG_MEMFD_CREATE=y
+CONFIG_PROC_FS=y
+CONFIG_PROC_SYSCTL=y
+# sysfs costs as much as all the rest together (+0.44 ms of boot, +0.39 MB
+# touched: a kernfs node for every device and driver) for little a container
+# uses: glibc counts CPUs from /proc/stat without it. Turn it on if an image
+# needs /sys; /init mounts it read-only when the kernel has it.
+# CONFIG_SYSFS is not set
+# The writable root: a tmpfs upper layer over the read-only EROFS image.
+CONFIG_OVERLAY_FS=y
+# CONFIG_OVERLAY_FS_REDIRECT_DIR is not set
+# CONFIG_OVERLAY_FS_INDEX is not set
+# CONFIG_OVERLAY_FS_METACOPY is not set
+# Left out on purpose: io_uring (a large kernel attack surface, and
+# containers rarely need it), AIO, POSIX message queues, cgroups and
+# namespaces (one container per VM), IPv6 (see networking above).
+# CONFIG_IO_URING is not set
+# CONFIG_AIO is not set
+# CONFIG_POSIX_MQUEUE is not set

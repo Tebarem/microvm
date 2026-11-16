@@ -1,0 +1,62 @@
+From: microvm <microvm@localhost>
+Subject: [PATCH] x86/alternatives: accept return sites pre-patched in the image
+
+Every return in a RETHUNK kernel is compiled as "jmp __x86_return_thunk",
+and apply_returns() rewrites all ~10k of them at boot for the thunk the
+CPU needs. In a microVM that is about a fifth of the boot, and it writes
+nearly every text page, so a kernel image mapped copy-on-write into many
+guests can't stay shared.
+
+A build step (guest/kernel/prepatch.py in microvm) can do the rewrite in
+the image instead and record the thunk it used in prepatched_return_thunk.
+If that is the thunk the kernel picked, there is nothing left to do for
+the built-in sites. If it isn't, sites jumping to the pre-patched thunk
+are treated like sites jumping to __x86_return_thunk and patched as usual,
+so an image pre-patched for one CPU still boots correctly on another.
+
+--- a/arch/x86/kernel/alternative.c	2026-11-04 08:56:33.590758540 +0100
++++ b/arch/x86/kernel/alternative.c	2026-11-04 08:56:33.610644467 +0100
+@@ -1135,13 +1135,33 @@
+ 	return i;
+ }
+ 
++/*
++ * The return thunk that the built-in return sites already jump to, when a
++ * build step rewrote them in the image (see the microvm prepatch tool);
++ * NULL when they jump to __x86_return_thunk as compiled. Written into the
++ * image, never by the kernel itself.
++ */
++void *prepatched_return_thunk __ro_after_init;
++
+ void __init_or_module noinline apply_returns(s32 *start, s32 *end)
+ {
++	void *prepatched = READ_ONCE(prepatched_return_thunk);
+ 	s32 *s;
+ 
+ 	if (cpu_wants_rethunk())
+ 		static_call_force_reinit();
+ 
++	/*
++	 * Pre-patched for the thunk this CPU uses: every site already reads
++	 * what the loop below would write (the thunk is the same at every
++	 * address unless it is the ITS one). Static call trampolines among the
++	 * sites end up the same too: __static_call_fixup() would turn them
++	 * into a RET, which is a jump to the same thunk.
++	 */
++	if (start == __return_sites && prepatched && prepatched == x86_return_thunk &&
++	    cpu_wants_rethunk() && x86_return_thunk != its_return_thunk)
++		return;
++
+ 	for (s = start; s < end; s++) {
+ 		void *dest = NULL, *addr = (void *)s + *s;
+ 		struct insn insn;
+@@ -1157,6 +1177,9 @@
+ 		op = insn.opcode.bytes[0];
+ 		if (op == JMP32_INSN_OPCODE)
+ 			dest = addr + insn.length + insn.immediate.value;
++		/* Pre-patched for another CPU: still a return site, patch it. */
++		if (prepatched && dest == prepatched)
++			dest = &__x86_return_thunk;
+ 
+ 		if (__static_call_fixup(addr, op, dest) ||
+ 		    WARN_ONCE(dest != &__x86_return_thunk,

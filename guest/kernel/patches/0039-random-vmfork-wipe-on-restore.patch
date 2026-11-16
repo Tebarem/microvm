@@ -1,0 +1,129 @@
+From: microvm
+Subject: [PATCH] random: RNDVMFORK, for a VM restored from a snapshot
+
+Every VM restored from one memory snapshot starts with the same memory,
+and so with the same random state in every process. microvm's /init
+already gives the kernel fresh host entropy and reseeds the CRNG after a
+restore. Userspace generators keep their own state, though: BoringSSL
+(Bun), Zig's std.crypto.random and the vDSO getrandom() state all gave
+every restored VM the same bytes.
+
+Those generators already handle the same problem for fork(): they keep
+a flag or their state in a MADV_WIPEONFORK page, which the child gets
+zeroed, and reseed when they find it zeroed. RNDVMFORK does that for
+every process of a restored VM: it reseeds the CRNG, then zaps every
+VM_WIPEONFORK mapping, so the next access faults in a zero page. The
+caller (/init) stops every other process first, as fork() leaves no
+other thread running in the child.
+
+The ioctl number sits well above the upstream ones, so a future
+upstream ioctl can't collide with it.
+
+--- a/include/uapi/linux/random.h	2026-11-05 05:33:37.295434643 +0100
++++ b/include/uapi/linux/random.h	2026-11-05 05:33:37.311409315 +0100
+@@ -38,6 +38,13 @@
+ /* Reseed CRNG.  (Superuser only.) */
+ #define RNDRESEEDCRNG	_IO( 'R', 0x07 )
+ 
++/*
++ * microvm: this system was restored from a memory snapshot, as other
++ * copies of it may be. Reseed the CRNG and empty every MADV_WIPEONFORK
++ * mapping of every process.  (Superuser only.)
++ */
++#define RNDVMFORK	_IO( 'R', 0x40 )
++
+ struct rand_pool_info {
+ 	int	entropy_count;
+ 	int	buf_size;
+--- a/drivers/char/random.c	2026-11-05 05:33:37.287447305 +0100
++++ b/drivers/char/random.c	2026-11-05 05:33:37.311409315 +0100
+@@ -54,6 +54,8 @@
+ #include <linux/suspend.h>
+ #include <linux/siphash.h>
+ #include <linux/sched/isolation.h>
++#include <linux/sched/mm.h>
++#include <linux/sched/signal.h>
+ #include <crypto/chacha.h>
+ #include <crypto/blake2s.h>
+ #ifdef CONFIG_VDSO_GETRANDOM
+@@ -1489,6 +1491,66 @@
+ 	return get_random_bytes_user(iter);
+ }
+ 
++/*
++ * microvm: every VM restored from one snapshot starts with the same
++ * memory, the random state of every process included. After the caller
++ * has added fresh entropy (RNDADDENTROPY), RNDVMFORK reseeds the CRNG
++ * and empties each MADV_WIPEONFORK mapping, as fork() does for a child.
++ * Userspace generators that detect forks that way (BoringSSL and AWS-LC,
++ * Zig's std.crypto.random, the vDSO getrandom() state) find their page
++ * zeroed and reseed before their next output. The caller stops every
++ * other process first, so nothing runs while their memory changes.
++ */
++static void vmfork_wipe_mm(struct mm_struct *mm)
++{
++	struct vm_area_struct *vma;
++	VMA_ITERATOR(vmi, mm, 0);
++
++	mmap_read_lock(mm);
++	for_each_vma(vmi, vma) {
++		if (vma->vm_flags & VM_WIPEONFORK)
++			zap_page_range_single(vma, vma->vm_start,
++					      vma->vm_end - vma->vm_start, NULL);
++	}
++	mmap_read_unlock(mm);
++}
++
++static long vmfork_wipe(void)
++{
++	struct task_struct *p;
++	struct mm_struct **mms;
++	unsigned int n = 0, max = 64, i;
++	long ret = 0;
++
++	rcu_read_lock();
++	for_each_process(p)
++		max++;
++	rcu_read_unlock();
++	mms = kvmalloc_array(max, sizeof(*mms), GFP_KERNEL);
++	if (!mms)
++		return -ENOMEM;
++	/* References first (no sleeping under RCU), then the wiping. */
++	rcu_read_lock();
++	for_each_process(p) {
++		struct mm_struct *mm;
++
++		if (n == max) {
++			ret = -EAGAIN; /* more processes than counted: call again */
++			break;
++		}
++		mm = get_task_mm(p); /* NULL for kernel threads */
++		if (mm)
++			mms[n++] = mm;
++	}
++	rcu_read_unlock();
++	for (i = 0; i < n; i++) {
++		vmfork_wipe_mm(mms[i]);
++		mmput(mms[i]);
++	}
++	kvfree(mms);
++	return ret;
++}
++
+ static long random_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+ {
+ 	int __user *p = (int __user *)arg;
+@@ -1547,6 +1609,13 @@
+ 			return -ENODATA;
+ 		crng_reseed(NULL);
+ 		return 0;
++	case RNDVMFORK:
++		if (!capable(CAP_SYS_ADMIN))
++			return -EPERM;
++		if (!crng_ready())
++			return -ENODATA;
++		crng_reseed(NULL);
++		return vmfork_wipe();
+ 	default:
+ 		return -EINVAL;
+ 	}

@@ -1,0 +1,68 @@
+Subject: [PATCH] printk: option to not log what the console suppresses
+
+A microVM booted with "quiet" still formats every boot message into the
+log buffer, twice each (once to size the record), and nothing ever reads
+most of them: a hundred messages, several percent of its boot.
+
+"printk_drop_suppressed" drops a kernel message before it is formatted
+if the console would suppress it: its level, from the format's prefix
+or the caller, is at or above console_loglevel (and ignore_loglevel is
+off). Continuations follow the message they continue. Messages whose
+level could only come from their arguments, and messages from user
+space, are logged as usual. Off by default.
+
+--- a/kernel/printk/printk.c	2026-10-30 13:06:41.000000000 +0100
++++ b/kernel/printk/printk.c	2026-11-04 10:53:24.566627602 +0100
+@@ -1287,6 +1287,42 @@
+ 	return (level >= console_loglevel && !ignore_loglevel);
+ }
+ 
++/*
++ * "printk_drop_suppressed": don't log the messages the console wouldn't
++ * print either. Storing a message formats it twice (once to size its
++ * record), and a microVM booted with "quiet" formats a hundred of them
++ * that nothing reads. The level comes from the format's prefix or the
++ * caller; a message whose level could only come from its arguments, and
++ * anything from user space, is logged as usual.
++ */
++static bool __read_mostly printk_drop_suppressed;
++static bool printk_last_dropped;
++
++static int __init printk_drop_suppressed_setup(char *str)
++{
++	printk_drop_suppressed = true;
++	return 0;
++}
++early_param("printk_drop_suppressed", printk_drop_suppressed_setup);
++
++static bool printk_drop(int facility, int level, const char *fmt)
++{
++	enum printk_info_flags flags = 0;
++
++	if (likely(!printk_drop_suppressed) || facility != 0)
++		return false;
++	printk_parse_prefix(fmt, &level, &flags);
++	if (level == LOGLEVEL_DEFAULT) {
++		/* A continuation goes with the message it continues. */
++		if (flags & LOG_CONT)
++			return printk_last_dropped;
++		printk_last_dropped = false;
++		return false;
++	}
++	printk_last_dropped = suppress_message_printing(level);
++	return printk_last_dropped;
++}
++
+ #ifdef CONFIG_BOOT_PRINTK_DELAY
+ 
+ static int boot_delay; /* msecs delay after each printk during bootup */
+@@ -2399,6 +2435,9 @@
+ 
+ 	printk_delay(level);
+ 
++	if (printk_drop(facility, level, fmt))
++		return 0;
++
+ 	printed_len = vprintk_store(facility, level, dev_info, fmt, args);
+ 
+ 	if (ft.nbcon_atomic)

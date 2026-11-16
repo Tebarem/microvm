@@ -1,0 +1,35 @@
+Subject: [PATCH] x86/apic: don't scan a virtual LAPIC's ISR/IRR for stale bits
+
+setup_local_APIC() reads all eight ISR and eight IRR registers to EOI
+interrupts a crashed previous kernel left in service. In a VM each read
+is an exit to the hypervisor's APIC emulation.
+
+A virtual LAPIC starts from reset with ISR and IRR clear. The only way to
+inherit stale bits is to be a crash kernel, so keep the scan for kdump
+kernels and for bare metal, where firmware may leave bits set too.
+
+--- a/arch/x86/kernel/apic/apic.c	2026-10-30 13:06:41.000000000 +0100
++++ b/arch/x86/kernel/apic/apic.c	2026-11-04 10:01:12.393040705 +0100
+@@ -21,6 +21,7 @@
+ #include <linux/acpi_pmtmr.h>
+ #include <linux/bitmap.h>
+ #include <linux/clockchips.h>
++#include <linux/crash_dump.h>
+ #include <linux/interrupt.h>
+ #include <linux/memblock.h>
+ #include <linux/ftrace.h>
+@@ -1480,6 +1481,14 @@
+ 	union apic_ir ir;
+ 	unsigned int i;
+ 
++	/*
++	 * A virtual LAPIC comes out of reset with ISR and IRR clear, and only
++	 * a crash kernel can inherit stale bits from a previous kernel. Skip
++	 * the 16 register reads (each a VM exit with an emulated xAPIC).
++	 */
++	if (boot_cpu_has(X86_FEATURE_HYPERVISOR) && !is_kdump_kernel())
++		return;
++
+ 	if (!apic_check_and_eoi_isr(&ir))
+ 		pr_warn("APIC: Stale ISR: %256pb\n", ir.map);
+ 

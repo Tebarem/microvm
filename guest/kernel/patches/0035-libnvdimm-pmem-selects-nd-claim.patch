@@ -1,0 +1,20 @@
+Subject: [PATCH] libnvdimm: the pmem driver needs ND_CLAIM on its own
+
+nd_pmem_probe() enables every namespace through devm_namespace_enable()
+-> devm_nsio_enable(), which lives in claim.c and is built only with
+CONFIG_ND_CLAIM. That symbol is selected by BTT and NVDIMM_PFN alone, so
+with both off (no ZONE_DEVICE, no BTT) the stub in nd-core.h returns
+-ENXIO and even a raw namespace never gets its /dev/pmemN.
+
+Select ND_CLAIM from BLK_DEV_PMEM.
+
+--- a/drivers/nvdimm/Kconfig	2026-10-30 13:06:41.000000000 +0100
++++ b/drivers/nvdimm/Kconfig	2026-11-04 12:21:16.387951372 +0100
+@@ -20,6 +20,7 @@
+ 	tristate "PMEM: Persistent memory block device support"
+ 	default LIBNVDIMM
+ 	select DAX
++	select ND_CLAIM
+ 	select ND_BTT if BTT
+ 	select ND_PFN if NVDIMM_PFN
+ 	help

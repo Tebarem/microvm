@@ -1,0 +1,39 @@
+Subject: [PATCH] libnvdimm: finish registering boot-time devices before /init
+
+nd_device_register() hands region and namespace devices to an exclusive
+async domain, which the async_synchronize_full() in kernel_init() does
+not wait for. With the root filesystem on an e820 (legacy PMEM) region
+and the initramfs's /init mounting it straight away, open("/dev/pmem0")
+races the namespace probe and fails with ENXIO.
+
+Wait for the nd domain at late_initcall_sync, which runs before
+kernel_init() goes on to execute /init. Synchronizing a domain also waits
+for work queued while it waits (a region's namespaces are scheduled from
+the region's own registration), so every boot-time namespace has its
+block device by then.
+
+--- a/drivers/nvdimm/bus.c	2026-10-30 13:06:41.000000000 +0100
++++ b/drivers/nvdimm/bus.c	2026-11-04 12:14:34.002418223 +0100
+@@ -483,6 +483,22 @@
+ }
+ EXPORT_SYMBOL_GPL(nd_synchronize);
+ 
++/*
++ * Region and namespace devices are registered (and probed) from
++ * nd_async_domain, which is exclusive, so kernel_init()'s
++ * async_synchronize_full() doesn't wait for it: without this, /init can
++ * run before /dev/pmemN exists. Registering a region schedules its
++ * namespaces from the same domain, and synchronizing a domain waits for
++ * work queued while it waits, so this returns with every boot-time
++ * namespace probed.
++ */
++static int __init nd_synchronize_before_init(void)
++{
++	nd_synchronize();
++	return 0;
++}
++late_initcall_sync(nd_synchronize_before_init);
++
+ static void nd_async_device_register(void *d, async_cookie_t cookie)
+ {
+ 	struct device *dev = d;

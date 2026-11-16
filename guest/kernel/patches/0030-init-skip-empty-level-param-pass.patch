@@ -1,0 +1,67 @@
+Subject: [PATCH] init: skip the per-level param pass when no param has that level
+
+Before each of the eight initcall levels, do_initcalls() copies the
+command line and parses all of it against every built-in kernel_param,
+to set the params of that level only. Most kernels have no such params
+(this one has 23, all at level -1, which are set before), so every pass
+tokenizes the whole command line and compares each option against the
+table for nothing.
+
+Skip the copy and the pass when no param belongs to the level.
+
+--- a/init/main.c	2026-11-04 11:02:06.327144412 +0100
++++ b/init/main.c	2026-11-04 11:02:06.399081025 +0100
+@@ -1307,15 +1307,35 @@
+ 	return 0;
+ }
+ 
++/* Does any built-in kernel_param belong to initcall level @level? */
++static bool __init initcall_level_has_params(int level)
++{
++	const struct kernel_param *kp;
++
++	for (kp = __start___param; kp < __stop___param; kp++)
++		if (kp->level == level)
++			return true;
++	return false;
++}
++
+ static void __init do_initcall_level(int level, char *command_line)
+ {
+ 	initcall_entry_t *fn;
+ 
+-	parse_args(initcall_level_names[level],
+-		   command_line, __start___param,
+-		   __stop___param - __start___param,
+-		   level, level,
+-		   NULL, ignore_unknown_bootoption);
++	/*
++	 * This pass only sets the params of this level; most kernels have
++	 * none, and re-parsing the whole command line for nothing, at every
++	 * level, adds up.
++	 */
++	if (initcall_level_has_params(level)) {
++		/* Parser modifies command_line, restore it each time */
++		strcpy(command_line, saved_command_line);
++		parse_args(initcall_level_names[level],
++			   command_line, __start___param,
++			   __stop___param - __start___param,
++			   level, level,
++			   NULL, ignore_unknown_bootoption);
++	}
+ 
+ 	do_trace_initcall_level(initcall_level_names[level]);
+ 	for (fn = initcall_levels[level]; fn < initcall_levels[level+1]; fn++)
+@@ -1332,11 +1352,8 @@
+ 	if (!command_line)
+ 		panic("%s: Failed to allocate %zu bytes\n", __func__, len);
+ 
+-	for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++) {
+-		/* Parser modifies command_line, restore it each time */
+-		strcpy(command_line, saved_command_line);
++	for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++)
+ 		do_initcall_level(level, command_line);
+-	}
+ 
+ 	kfree(command_line);
+ }

@@ -1,0 +1,65 @@
+From: microvm <microvm@localhost>
+Subject: [PATCH] x86/rtc: take the boot wall clock from the command line
+
+"wallclock=SEC[.NSEC]" gives the wall-clock time at boot. The VMM writes it
+when it builds the command line. Without it, the read at boot goes through
+the CMOS RTC: ~22 port accesses, each a VM exit (~90 us on WHP), for a time
+with only one-second resolution. Only the first read uses the value; later
+reads (resume) go to the RTC as before.
+
+--- a/arch/x86/kernel/rtc.c	2026-10-30 13:06:41.000000000 +0100
++++ b/arch/x86/kernel/rtc.c	2026-11-04 08:31:37.955020781 +0100
+@@ -105,9 +105,53 @@
+ 	return x86_platform.set_wallclock(&now);
+ }
+ 
++/*
++ * "wallclock=SEC[.NSEC]": the boot-time wall clock, from the hypervisor.
++ * Used once, for the read at boot. That spares the CMOS RTC read: ~22 port
++ * accesses, each a VM exit, and only one-second resolution.
++ */
++static struct timespec64 cmdline_wallclock;
++static bool cmdline_wallclock_valid;
++
++static int __init parse_wallclock(char *arg)
++{
++	long long sec;
++	unsigned long nsec = 0;
++	char *end;
++
++	if (!arg)
++		return -EINVAL;
++	sec = simple_strtoll(arg, &end, 10);
++	if (end == arg || sec < 0)
++		return -EINVAL;
++	if (*end == '.') {
++		char *frac = end + 1;
++		int digits;
++
++		nsec = simple_strtoul(frac, &end, 10);
++		digits = end - frac;
++		if (digits < 1 || digits > 9)
++			return -EINVAL;
++		for (; digits < 9; digits++)
++			nsec *= 10;
++	}
++	if (*end)
++		return -EINVAL;
++	cmdline_wallclock.tv_sec = sec;
++	cmdline_wallclock.tv_nsec = nsec;
++	cmdline_wallclock_valid = true;
++	return 0;
++}
++early_param("wallclock", parse_wallclock);
++
+ /* not static: needed by APM */
+ void read_persistent_clock64(struct timespec64 *ts)
+ {
++	if (cmdline_wallclock_valid) {
++		*ts = cmdline_wallclock;
++		cmdline_wallclock_valid = false;
++		return;
++	}
+ 	x86_platform.get_wallclock(ts);
+ }
+ 

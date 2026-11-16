@@ -1,0 +1,42 @@
+From: microvm <microvm@localhost>
+Subject: [PATCH] x86: add "noroms" to skip legacy BIOS/option ROM probing
+
+probe_roms() reads the ISA ROM window 0xc0000-0xf0000 in 2 KB steps
+looking for ROM signatures. A microVM that boots straight into the kernel
+has no ROMs there, and every page read makes the hypervisor back it: 48
+pages per VM. "noroms" skips the probe; the region stays reserved as
+before.
+
+--- a/arch/x86/kernel/probe_roms.c	2026-11-04 07:48:53.696477322 +0100
++++ b/arch/x86/kernel/probe_roms.c	2026-11-04 07:48:53.708523292 +0100
+@@ -196,6 +196,20 @@
+ 	return !length && !sum;
+ }
+ 
++/*
++ * "noroms": the platform has no BIOS or option ROMs (e.g. a microVM booted
++ * straight into the kernel). Probing reads 0xc0000-0xf0000 in 2 KB steps,
++ * which makes the hypervisor back 192 KB of guest memory for nothing.
++ */
++static bool no_roms __initdata;
++
++static int __init parse_noroms(char *arg)
++{
++	no_roms = true;
++	return 0;
++}
++early_param("noroms", parse_noroms);
++
+ void __init probe_roms(void)
+ {
+ 	unsigned long start, length, upper;
+@@ -203,6 +217,9 @@
+ 	unsigned char c;
+ 	int i;
+ 
++	if (no_roms)
++		return;
++
+ 	/* video rom */
+ 	upper = adapter_rom_resources[0].start;
+ 	for (start = video_rom_resource.start; start < upper; start += 2048) {

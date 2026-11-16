@@ -1,0 +1,140 @@
+Subject: [PATCH] x86/mm/init: one E820 scan for the slots past the end of RAM
+
+phys_{pte,pmd,pud,p4d}_init() clear every table slot past paddr_end that
+no E820 RAM or ACPI entry overlaps, and test each slot with two full
+table scans. Each init_memory_mapping() call walks hundreds of such slots
+(the rest of the PUD page above a small guest's RAM), so this ran
+thousands of scans per boot.
+
+Scan once for the next RAM/ACPI address at or above the slot and reuse
+the answer while it stays above the slot address: the slots only move
+up, so it stays exact. Which slots are cleared is unchanged.
+
+--- a/arch/x86/mm/init_64.c	2026-11-04 09:50:25.248318049 +0100
++++ b/arch/x86/mm/init_64.c	2026-11-04 09:50:25.296175414 +0100
+@@ -468,6 +468,41 @@
+  * Create PTE level page table mapping for physical addresses.
+  * It returns the last physical address mapped.
+  */
++/*
++ * Lowest address >= start inside an E820 RAM or ACPI entry, or U64_MAX:
++ * [start, end) overlaps such an entry iff the result is < end.
++ */
++static u64 __meminit e820_next_ram_acpi(u64 start)
++{
++	u64 next = U64_MAX;
++	u32 i;
++
++	for (i = 0; i < e820_table->nr_entries; i++) {
++		const struct e820_entry *e = &e820_table->entries[i];
++
++		if (e->type != E820_TYPE_RAM && e->type != E820_TYPE_ACPI)
++			continue;
++		if (e->addr + e->size <= start)
++			continue;
++		next = min(next, max(e->addr, start));
++	}
++	return next;
++}
++
++/*
++ * !e820__mapped_any(start, end, RAM) && !e820__mapped_any(start, end, ACPI)
++ * for a loop whose start never decreases. *next caches the last answer of
++ * e820_next_ram_acpi(), which stays exact while it is above start, so the
++ * hundreds of empty slots past the end of RAM cost one table scan, not two
++ * each.
++ */
++static bool __meminit e820_no_ram_acpi(u64 *next, u64 start, u64 end)
++{
++	if (*next <= start)
++		*next = e820_next_ram_acpi(start);
++	return *next >= end;
++}
++
+ static unsigned long __meminit
+ phys_pte_init(pte_t *pte_page, unsigned long paddr, unsigned long paddr_end,
+ 	      pgprot_t prot, bool init)
+@@ -475,6 +510,7 @@
+ 	unsigned long pages = 0, paddr_next;
+ 	unsigned long paddr_last = paddr_end;
+ 	pte_t *pte;
++	u64 e820_next = 0;
+ 	int i;
+ 
+ 	pte = pte_page + pte_index(paddr);
+@@ -484,10 +520,8 @@
+ 		paddr_next = (paddr & PAGE_MASK) + PAGE_SIZE;
+ 		if (paddr >= paddr_end) {
+ 			if (!after_bootmem &&
+-			    !e820__mapped_any(paddr & PAGE_MASK, paddr_next,
+-					     E820_TYPE_RAM) &&
+-			    !e820__mapped_any(paddr & PAGE_MASK, paddr_next,
+-					     E820_TYPE_ACPI))
++			    e820_no_ram_acpi(&e820_next, paddr & PAGE_MASK,
++					     paddr_next))
+ 				set_pte_init(pte, __pte(0), init);
+ 			continue;
+ 		}
+@@ -530,6 +564,7 @@
+ 	unsigned long paddr_last = paddr_end;
+ 
+ 	int i = pmd_index(paddr);
++	u64 e820_next = 0;
+ 
+ 	for (; i < PTRS_PER_PMD; i++, paddr = paddr_next) {
+ 		pmd_t *pmd = pmd_page + pmd_index(paddr);
+@@ -539,10 +574,8 @@
+ 		paddr_next = (paddr & PMD_MASK) + PMD_SIZE;
+ 		if (paddr >= paddr_end) {
+ 			if (!after_bootmem &&
+-			    !e820__mapped_any(paddr & PMD_MASK, paddr_next,
+-					     E820_TYPE_RAM) &&
+-			    !e820__mapped_any(paddr & PMD_MASK, paddr_next,
+-					     E820_TYPE_ACPI))
++			    e820_no_ram_acpi(&e820_next, paddr & PMD_MASK,
++					     paddr_next))
+ 				set_pmd_init(pmd, __pmd(0), init);
+ 			continue;
+ 		}
+@@ -614,6 +647,7 @@
+ 	unsigned long paddr_last = paddr_end;
+ 	unsigned long vaddr = (unsigned long)__va(paddr);
+ 	int i = pud_index(vaddr);
++	u64 e820_next = 0;
+ 
+ 	for (; i < PTRS_PER_PUD; i++, paddr = paddr_next) {
+ 		pud_t *pud;
+@@ -626,10 +660,8 @@
+ 
+ 		if (paddr >= paddr_end) {
+ 			if (!after_bootmem &&
+-			    !e820__mapped_any(paddr & PUD_MASK, paddr_next,
+-					     E820_TYPE_RAM) &&
+-			    !e820__mapped_any(paddr & PUD_MASK, paddr_next,
+-					     E820_TYPE_ACPI))
++			    e820_no_ram_acpi(&e820_next, paddr & PUD_MASK,
++					     paddr_next))
+ 				set_pud_init(pud, __pud(0), init);
+ 			continue;
+ 		}
+@@ -694,6 +726,7 @@
+ 	      unsigned long page_size_mask, pgprot_t prot, bool init)
+ {
+ 	unsigned long vaddr, vaddr_end, vaddr_next, paddr_next, paddr_last;
++	u64 e820_next = 0;
+ 
+ 	paddr_last = paddr_end;
+ 	vaddr = (unsigned long)__va(paddr);
+@@ -713,10 +746,8 @@
+ 		if (paddr >= paddr_end) {
+ 			paddr_next = __pa(vaddr_next);
+ 			if (!after_bootmem &&
+-			    !e820__mapped_any(paddr & P4D_MASK, paddr_next,
+-					     E820_TYPE_RAM) &&
+-			    !e820__mapped_any(paddr & P4D_MASK, paddr_next,
+-					     E820_TYPE_ACPI))
++			    e820_no_ram_acpi(&e820_next, paddr & P4D_MASK,
++					     paddr_next))
+ 				set_p4d_init(p4d, __p4d(0), init);
+ 			continue;
+ 		}

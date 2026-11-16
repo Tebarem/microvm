@@ -1,0 +1,31 @@
+Subject: [PATCH] vsock/virtio: don't send a credit update after every read
+
+virtio_transport_stream_do_dequeue() sends a credit update when the
+receive queue holds fewer bytes than SO_RCVLOWAT. With the default of 1,
+that is true whenever a read empties the queue, so a request/response
+exchange sent one credit update per message. Each one is a transmit
+packet, a queue kick and a completion interrupt: on microvm, 3 of the ~8
+VM exits of a vsock round trip.
+
+The free_space test already sends an update before the sender can run
+out of credit, so keep the rcvlowat test only for SO_RCVLOWAT > 1, which
+is what it was added for.
+
+--- a/net/vmw_vsock/virtio_transport_common.c	2026-11-04 17:59:45.582113527 +0100
++++ b/net/vmw_vsock/virtio_transport_common.c	2026-11-04 17:59:45.674550904 +0100
+@@ -770,8 +770,13 @@
+ 
+ 	fwd_cnt_delta = vvs->fwd_cnt - vvs->last_fwd_cnt;
+ 	free_space = vvs->buf_alloc - fwd_cnt_delta;
+-	low_rx_bytes = (vvs->rx_bytes <
+-			sock_rcvlowat(sk_vsock(vsk), 0, INT_MAX));
++	/* With the default SO_RCVLOWAT of 1, an emptied queue counts as
++	 * "low" after every read, so every read sent a credit update: a
++	 * packet, a kick and an interrupt per message. A sender stalled for
++	 * credit is already caught by the free_space test below.
++	 */
++	low_rx_bytes = sk_vsock(vsk)->sk_rcvlowat > 1 &&
++		       vvs->rx_bytes < sock_rcvlowat(sk_vsock(vsk), 0, INT_MAX);
+ 
+ 	spin_unlock_bh(&vvs->rx_lock);
+ 

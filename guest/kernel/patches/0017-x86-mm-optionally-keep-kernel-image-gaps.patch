@@ -1,0 +1,48 @@
+From: microvm <microvm@localhost>
+Subject: [PATCH] x86/mm: optionally keep the kernel image's alignment gaps
+
+mark_rodata_ro() frees the 2 MiB alignment padding between text and rodata
+and between rodata and data. Freeing it makes it writable again, page by
+page, in both the kernel mapping and the direct map, after splitting their
+large pages: in a 64 MiB microVM that is ~1M cycles, ~14% of the boot.
+
+"keep_image_gaps" skips that. The padding stays reserved, read-only and
+non-executable, so no protection changes. The cost is ~2.5 MiB that never
+becomes free memory: to a VMM that backs guest RAM on demand, untouched
+padding costs nothing.
+
+--- a/arch/x86/mm/init_64.c	2026-10-30 13:06:41.000000000 +0100
++++ b/arch/x86/mm/init_64.c	2026-11-04 08:49:55.808261465 +0100
+@@ -1408,6 +1408,23 @@
+ 
+ int kernel_set_to_readonly;
+ 
++/*
++ * "keep_image_gaps": don't free the 2 MiB alignment padding after the
++ * kernel text and after rodata. Freeing it means making those pages
++ * writable again one 4 KiB page at a time, in both the kernel mapping and
++ * the direct map: most of the CPA work of a small guest's boot. The cost
++ * is the padding (~2.5 MiB) not becoming free memory. It stays reserved,
++ * read-only and non-executable.
++ */
++static bool keep_image_gaps __ro_after_init;
++
++static int __init parse_keep_image_gaps(char *arg)
++{
++	keep_image_gaps = true;
++	return 0;
++}
++early_param("keep_image_gaps", parse_keep_image_gaps);
++
+ void mark_rodata_ro(void)
+ {
+ 	unsigned long start = PFN_ALIGN(_text);
+@@ -1448,6 +1465,8 @@
+ 	set_memory_ro(start, (end-start) >> PAGE_SHIFT);
+ #endif
+ 
++	if (keep_image_gaps)
++		return;
+ 	free_kernel_image_pages("unused kernel image (text/rodata gap)",
+ 				(void *)text_end, (void *)rodata_start);
+ 	free_kernel_image_pages("unused kernel image (rodata/data gap)",

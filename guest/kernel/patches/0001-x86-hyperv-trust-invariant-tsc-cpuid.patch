@@ -1,0 +1,22 @@
+From: microvm
+Subject: [PATCH] x86/hyperv: keep the TSC when CPUID reports it invariant
+
+Windows Hypervisor Platform (WHP) partitions can't expose the Hyper-V
+"TSC invariant controls" enlightenment, so Linux marks the TSC unstable and
+falls back to the jiffies clocksource: 10 ms time resolution at HZ=100.
+
+The VMM does report an invariant TSC in CPUID 0x80000007 EDX[8], which sets
+X86_FEATURE_NONSTOP_TSC. Trust that and keep the TSC clocksource.
+
+--- a/arch/x86/kernel/cpu/mshyperv.c
++++ b/arch/x86/kernel/cpu/mshyperv.c
+@@ -666,7 +666,8 @@
+ 	 * need to check for it.
+ 	 */
+ 	if (!hv_root_partition() &&
+-	    !(ms_hyperv.features & HV_ACCESS_TSC_INVARIANT))
++	    !(ms_hyperv.features & HV_ACCESS_TSC_INVARIANT) &&
++	    !boot_cpu_has(X86_FEATURE_NONSTOP_TSC))
+ 		mark_tsc_unstable("running on Hyper-V");
+
+ 	hardlockup_detector_disable();

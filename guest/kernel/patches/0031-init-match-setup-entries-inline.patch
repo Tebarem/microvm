@@ -1,0 +1,49 @@
+Subject: [PATCH] init: match boot options against __setup entries inline
+
+Every boot option is compared with every __setup entry twice: once for
+early params, once in obsolete_checksetup(). Both went through an out-of-
+line parameqn() call per entry (per character, in obsolete_checksetup),
+and with a return thunk those calls are most of the cost: 14 options and
+273 entries make thousands of them.
+
+Compare the characters inline, treating '-' and '_' alike as parameqn()
+does, and only call parameqn() for early params once the first character
+matches.
+
+--- a/init/main.c	2026-11-04 11:04:09.352762062 +0100
++++ b/init/main.c	2026-11-04 11:04:09.372728179 +0100
+@@ -196,6 +196,15 @@
+ static const char *panic_later, *panic_param;
+ 
+ /*
++ * Boot options are matched against every __setup entry, so compare inline
++ * rather than call parameqn() per entry: '-' and '_' are equal, as there.
++ */
++static __always_inline bool __init setup_char_eq(char a, char b)
++{
++	return (a == '-' ? '_' : a) == (b == '-' ? '_' : b);
++}
++
++/*
+  * parameqn(line, str, strlen(str)), but stopping at the first mismatch
+  * instead of measuring every __setup string for every boot option.
+  */
+@@ -204,7 +213,7 @@
+ 	size_t n;
+ 
+ 	for (n = 0; str[n]; n++)
+-		if (!parameqn(line + n, str + n, 1))
++		if (!setup_char_eq(line[n], str[n]))
+ 			return false;
+ 	*len = n;
+ 	return true;
+@@ -742,7 +751,8 @@
+ 	const size_t len = strlen(param) + 1;
+ 
+ 	for (p = __setup_start; p < __setup_end; p++) {
+-		if (p->early && parameqn(param, p->str, len)) {
++		if (p->early && setup_char_eq(param[0], p->str[0]) &&
++		    parameqn(param, p->str, len)) {
+ 			if (p->setup_func(val) != 0)
+ 				pr_warn("Malformed early option '%s'\n", param);
+ 		}

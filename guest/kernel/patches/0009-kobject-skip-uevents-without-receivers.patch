@@ -1,0 +1,49 @@
+From: microvm <microvm@localhost>
+Subject: [PATCH] kobject: don't build uevents nobody can receive
+
+Without CONFIG_NET there is no uevent netlink socket, and without a
+uevent helper nothing else consumes uevents, yet kobject_uevent_env()
+still allocates an environment, walks the kobject path and formats a
+dozen variables for every device registered at boot. Skip that when
+there can be no receiver, keeping the sequence number and the "add
+event sent" state an event would have left behind.
+
+--- a/lib/kobject_uevent.c	2026-10-30 13:06:41.000000000 +0100
++++ b/lib/kobject_uevent.c	2026-11-04 08:02:12.122057987 +0100
+@@ -460,6 +460,21 @@
+ 	}
+ }
+ 
++/*
++ * Can anyone receive a uevent? Without netlink and without a uevent helper
++ * nobody can, and building the environment (allocation, path walk, a
++ * dozen printf-formatted variables) is most of the cost of registering a
++ * device on a minimal kernel.
++ */
++static bool uevent_has_receivers(void)
++{
++#ifdef CONFIG_UEVENT_HELPER
++	if (uevent_helper[0])
++		return true;
++#endif
++	return IS_ENABLED(CONFIG_NET);
++}
++
+ /**
+  * kobject_uevent_env - send an uevent with environmental data
+  *
+@@ -536,6 +551,14 @@
+ 		return 0;
+ 	}
+ 
++	if (!uevent_has_receivers()) {
++		/* Keep the state an event would leave behind. */
++		if (action == KOBJ_ADD)
++			kobj->state_add_uevent_sent = 1;
++		atomic64_inc(&uevent_seqnum);
++		return 0;
++	}
++
+ 	/* environment buffer */
+ 	env = kzalloc(sizeof(struct kobj_uevent_env), GFP_KERNEL);
+ 	if (!env)

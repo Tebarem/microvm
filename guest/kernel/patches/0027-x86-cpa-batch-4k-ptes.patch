@@ -1,0 +1,132 @@
+Subject: [PATCH] x86/mm/cpa: change a run of 4k PTEs in one step
+
+Once a large page is split, change_page_attr handles its pages one at a
+time: a full page table walk, the protection checks and an alias pass
+per 4k page. At boot that is thousands of steps (mark_rodata_ro's NX
+sweep crosses the text/rodata gap and the data/bss large page that the
+read-only IDT split, then the init memory is freed), about a tenth of a
+microVM's boot.
+
+Handle the rest of the page table in the step that found it, as long as
+the pages map contiguous pfns and agree on everything the alias pass
+decides from address and pfn. Each page still gets its own protection
+checks, so the resulting PTEs are the same; the aliases of the run are
+then processed as one range, as they already are for a preserved large
+page.
+
+--- a/arch/x86/mm/pat/set_memory.c	2026-11-04 10:49:23.424040195 +0100
++++ b/arch/x86/mm/pat/set_memory.c	2026-11-04 10:49:23.463993216 +0100
+@@ -1856,6 +1856,20 @@
+ 	}
+ }
+ 
++/*
++ * Everything cpa_process_alias() decides about one page, from its address
++ * and pfn: a run of 4k pages that agree on all of it gets the same alias
++ * handling as a single range as it would page by page.
++ */
++static unsigned int cpa_alias_class(unsigned long vaddr, unsigned long pfn)
++{
++	return pfn_range_is_mapped(pfn, pfn + 1) |
++	       within(vaddr, PAGE_OFFSET,
++		      PAGE_OFFSET + (max_pfn_mapped << PAGE_SHIFT)) << 1 |
++	       within(vaddr, (unsigned long)_text, _brk_end) << 2 |
++	       __cpa_pfn_in_highmap(pfn) << 3;
++}
++
+ static int __change_page_attr(struct cpa_data *cpa, int primary)
+ {
+ 	unsigned long address;
+@@ -1875,39 +1889,63 @@
+ 		return __cpa_process_fault(cpa, address, primary);
+ 
+ 	if (level == PG_LEVEL_4K) {
+-		pte_t new_pte;
+-		pgprot_t old_prot = pte_pgprot(old_pte);
+-		pgprot_t new_prot = pte_pgprot(old_pte);
+-		unsigned long pfn = pte_pfn(old_pte);
+-
+-		pgprot_val(new_prot) &= ~pgprot_val(cpa->mask_clr);
+-		pgprot_val(new_prot) |= pgprot_val(cpa->mask_set);
+-
+-		cpa_inc_4k_install();
+-		/* Hand in lpsize = 0 to enforce the protection mechanism */
+-		new_prot = static_protections(new_prot, address, pfn, 1, 0,
+-					      CPA_PROTECT);
+-
+-		new_prot = verify_rwx(old_prot, new_prot, address, pfn, 1,
+-				      nx, rw);
++		unsigned long pfn0 = pte_pfn(old_pte), n = 1, i;
++		unsigned int class = cpa_alias_class(address, pfn0);
+ 
+-		new_prot = pgprot_clear_protnone_bits(new_prot);
+-
+-		/*
+-		 * We need to keep the pfn from the existing PTE,
+-		 * after all we're only going to change its attributes
+-		 * not the memory it points to
+-		 */
+-		new_pte = pfn_pte(pfn, new_prot);
+-		cpa->pfn = pfn;
+ 		/*
+-		 * Do we really change anything ?
++		 * The rest of this page table maps the pages that follow, so
++		 * change as many of them as the request covers here, instead
++		 * of walking the page tables again for each. A run stops where
++		 * the pfns stop being contiguous or the alias handling would
++		 * differ: the caller processes the aliases of [pfn0, pfn0 + n)
++		 * as one range.
+ 		 */
+-		if (pte_val(old_pte) != pte_val(new_pte)) {
+-			set_pte_atomic(kpte, new_pte);
+-			cpa->flags |= CPA_FLUSHTLB;
++		if (!(cpa->flags & (CPA_ARRAY | CPA_PAGES_ARRAY)))
++			n = min(cpa->numpages, PTRS_PER_PTE - pte_index(address));
++
++		for (i = 0; i < n; i++, kpte++, address += PAGE_SIZE) {
++			pte_t new_pte;
++			pgprot_t old_prot, new_prot;
++			unsigned long pfn;
++
++			if (i) {
++				old_pte = *kpte;
++				if (pte_none(old_pte) || pte_pfn(old_pte) != pfn0 + i ||
++				    cpa_alias_class(address, pfn0 + i) != class)
++					break;
++			}
++			old_prot = new_prot = pte_pgprot(old_pte);
++			pfn = pte_pfn(old_pte);
++
++			pgprot_val(new_prot) &= ~pgprot_val(cpa->mask_clr);
++			pgprot_val(new_prot) |= pgprot_val(cpa->mask_set);
++
++			cpa_inc_4k_install();
++			/* Hand in lpsize = 0 to enforce the protection mechanism */
++			new_prot = static_protections(new_prot, address, pfn, 1, 0,
++						      CPA_PROTECT);
++
++			new_prot = verify_rwx(old_prot, new_prot, address, pfn, 1,
++					      nx, rw);
++
++			new_prot = pgprot_clear_protnone_bits(new_prot);
++
++			/*
++			 * We need to keep the pfn from the existing PTE,
++			 * after all we're only going to change its attributes
++			 * not the memory it points to
++			 */
++			new_pte = pfn_pte(pfn, new_prot);
++			/*
++			 * Do we really change anything ?
++			 */
++			if (pte_val(old_pte) != pte_val(new_pte)) {
++				set_pte_atomic(kpte, new_pte);
++				cpa->flags |= CPA_FLUSHTLB;
++			}
+ 		}
+-		cpa->numpages = 1;
++		cpa->pfn = pfn0;
++		cpa->numpages = i;
+ 		return 0;
+ 	}
+ 

@@ -1,0 +1,55 @@
+From: microvm <microvm@localhost>
+Subject: [PATCH] x86/early_printk: add the microvm console port
+
+"earlyprintk=microvm[,keep]" writes the kernel log to the microvm VMM's
+console port (0x702), 4 bytes per port write. A 16550 costs two VM exits
+per byte (data plus a line-status poll) and its driver probes the port
+with ~35 more accesses at boot; with this console a guest needs no UART
+driver at all.
+
+--- a/arch/x86/kernel/early_printk.c	2026-10-30 13:06:41.000000000 +0100
++++ b/arch/x86/kernel/early_printk.c	2026-11-04 08:22:47.648872204 +0100
+@@ -363,6 +363,32 @@
+ }
+ #endif
+ 
++/*
++ * microvm console port: each write carries 1, 2 or 4 bytes (the access
++ * width) and costs one VM exit, where a UART costs two exits per byte
++ * (data plus a line-status poll).
++ */
++#define MICROVM_CONSOLE_PORT	0x702
++
++static void early_microvm_write(struct console *con, const char *s, unsigned int n)
++{
++	u32 w;
++
++	for (; n >= 4; s += 4, n -= 4) {
++		memcpy(&w, s, 4);
++		outl(w, MICROVM_CONSOLE_PORT);
++	}
++	for (; n; s++, n--)
++		outb(*s, MICROVM_CONSOLE_PORT);
++}
++
++static struct console early_microvm_console = {
++	.name =		"microvm",
++	.write =	early_microvm_write,
++	.flags =	CON_PRINTBUFFER,
++	.index =	-1,
++};
++
+ static struct console early_serial_console = {
+ 	.name =		"earlyser",
+ 	.write =	early_serial_write,
+@@ -414,6 +440,10 @@
+ 			early_serial_init(buf + 4);
+ 			early_console_register(&early_serial_console, keep);
+ 		}
++		if (!strncmp(buf, "microvm", 7)) {
++			buf += 7;
++			early_console_register(&early_microvm_console, keep);
++		}
+ #ifdef CONFIG_PCI
+ 		if (!strncmp(buf, "pciserial", 9)) {
+ 			buf += 9; /* Keep from match the above "pciserial" */

@@ -1,0 +1,380 @@
+Subject: [PATCH] x86/alternatives: accept an image whose text is pre-patched
+
+A microVM boots the same image on the same CPU model every time, and
+every boot rewrites the same ~800 places in the kernel text (retpolines,
+alternatives, ENDBR sealing): about a tenth of boot, and the rewrite dirties
+~120 text pages that copy-on-write VMs could otherwise share.
+
+Let the build record the result instead. Booted with "alt_snapshot=before"
+and then "alt_snapshot", the kernel stops the VM through the microvm exit
+port just before and just after the rewrite, the second time with the
+inputs that decided it (CPU feature and bug bits, the return thunk, the
+paravirt ops), and the VMM dumps guest memory each time. The text that
+differs between the two dumps is exactly what the rewrite wrote:
+guest/kernel/prepatch.py --alternatives copies it into the image, with
+those inputs and an undo table of the compiled bytes.
+
+At boot, a pre-patched image skips the rewrite only if the inputs match
+byte for byte. If anything differs (another CPU, other mitigations on the
+command line, other paravirt ops), the undo table restores the compiled
+text first and patching runs as usual, so the result is always what this
+kernel would have patched. A run is restored only if it still holds the
+pre-patched bytes: if other boot code (static calls) rewrote it first,
+a fresh image would hold that code's bytes there too. Configurations
+whose rewrite depends on run-time state (ITS thunks, call depth
+tracking, FineIBT) are never pre-patched.
+
+An SMP kernel booted with one CPU also takes its LOCK prefixes out in
+the same rewrite, so the inputs say whether this boot does: an image
+pre-patched on one CPU patches as usual when it boots on several.
+
+The pre-patched text runs from the first instruction of the boot, so on
+another CPU the code before the patch point would already take the
+patching CPU's choices: identify_cpu() set CR4.PKE on a vCPU without PKU
+and the guest died with a #GP. So the inputs start with the CPUID leaves
+the CPU features come from, read first thing in x86_64_start_kernel().
+If those differ, the compiled text goes back right there, before any
+pre-patched site has run, and the boot is that of a fresh image.
+
+--- a/arch/x86/include/asm/alternative.h	2026-10-30 12:06:41.000000000 +0000
++++ b/arch/x86/include/asm/alternative.h	2026-11-04 22:21:25.226586665 +0000
+@@ -96,6 +96,7 @@
+ extern int alternatives_patched;
+ 
+ extern void alternative_instructions(void);
++extern void alt_prepatch_early(void);
+ extern void apply_alternatives(struct alt_instr *start, struct alt_instr *end);
+ extern void apply_retpolines(s32 *start, s32 *end);
+ extern void apply_returns(s32 *start, s32 *end);
+--- a/arch/x86/kernel/alternative.c	2026-11-04 22:19:13.522588780 +0000
++++ b/arch/x86/kernel/alternative.c	2026-11-04 22:21:22.498586709 +0000
+@@ -2492,8 +2492,218 @@
+  */
+ static bool text_poke_early_batch __read_mostly;
+ 
++/*
++ * Pre-patched images (guest/kernel/prepatch.py --alternatives).
++ *
++ * Booting with "alt_snapshot=before" stops the VM through the microvm
++ * exit port (status 0x53) just before the rewrite; "alt_snapshot" stops
++ * just after it, with the inputs that decided every rewrite (CPU feature
++ * and bug bits, the return thunk, the paravirt ops) in alt_prepatch.inputs.
++ * The VMM dumps guest memory each time. The text that differs between the
++ * two dumps is what this function wrote: the tool copies it into the
++ * image, with those inputs and an undo table.
++ *
++ * A pre-patched image skips the rewrite only if this boot's inputs are
++ * byte for byte the recorded ones. Otherwise it puts the compiled bytes
++ * back from the undo table and patches as usual: a different CPU or
++ * different mitigations cost the time, never correctness. A run is put
++ * back only if it still holds the pre-patched bytes; if other boot code
++ * rewrote it first (a static call trampoline, say), a fresh image would
++ * hold that code's bytes there too, so they stay.
++ *
++ * The pre-patched text runs from the first instruction of the boot, long
++ * before the patch point: identify_cpu(), the FPU setup and others test
++ * features through alternatives. On another CPU those would take the
++ * patching CPU's choices (set CR4.PKE without PKU, run XSAVES without
++ * it), so whether this is the same CPU can't wait for the inputs. The
++ * inputs therefore start with the CPUID leaves the features come from, as
++ * read by alt_prepatch_early(), the first thing x86_64_start_kernel()
++ * does. If those differ, the compiled bytes go back right there, before
++ * any pre-patched site has run, and the boot is that of a fresh image.
++ */
++#define ALT_PREPATCH_MAGIC	0x3148435441505041ULL	/* "APPATCH1" */
++#define ALT_INPUTS_MAX		1024
++#define ALT_UNDO_MAX		(64 << 10)
++
++struct alt_prepatch {
++	u64 magic;
++	u32 inputs_len;
++	u32 undo_len;	/* entries: s32 offset from _text, u16 length,
++			 * compiled bytes, pre-patched bytes */
++	u8 inputs[ALT_INPUTS_MAX];
++	u8 undo[ALT_UNDO_MAX];
++};
++
++/* Not static: the tool finds it by symbol. */
++struct alt_prepatch alt_prepatch __initdata __aligned(8);
++
++enum { ALT_SNAP_NONE, ALT_SNAP_AFTER, ALT_SNAP_BEFORE };
++static int alt_snapshot __initdata;
++
++static int __init parse_alt_snapshot(char *arg)
++{
++	alt_snapshot = arg && !strcmp(arg, "before") ? ALT_SNAP_BEFORE : ALT_SNAP_AFTER;
++	return 0;
++}
++early_param("alt_snapshot", parse_alt_snapshot);
++
++/*
++ * Rewrites this kernel can't pre-apply: they depend on run-time state
++ * (ITS thunks live in allocated memory) or patch more than the text.
++ */
++static bool __init alt_prepatch_supported(void)
++{
++	return !IS_ENABLED(CONFIG_CALL_THUNKS) && !IS_ENABLED(CONFIG_FINEIBT) &&
++	       !cpu_feature_enabled(X86_FEATURE_INDIRECT_THUNK_ITS);
++}
++
++/*
++ * Where the CPU features come from: the leaves get_cpu_cap() reads, and the
++ * hypervisor's signature. Scattered features (power, RDT, SGX, PMU leaves)
++ * gate no instruction; they are in the capability words checked later.
++ */
++static const u32 alt_cpuid_leaves[][2] __initconst = {
++	{ 0x00000000, 0 }, { 0x00000001, 0 }, { 0x00000006, 0 },
++	{ 0x00000007, 0 }, { 0x00000007, 1 }, { 0x0000000d, 1 },
++	{ 0x80000000, 0 }, { 0x80000001, 0 }, { 0x80000007, 0 },
++	{ 0x80000008, 0 }, { 0x8000000a, 0 }, { 0x8000001f, 0 },
++	{ 0x80000021, 0 }, { 0x40000000, 0 },
++};
++static u32 alt_cpuid[ARRAY_SIZE(alt_cpuid_leaves)][4] __initdata;
++/* The compiled text was put back by alt_prepatch_early(). */
++static bool alt_restored __initdata;
++static bool alt_undo_bad __initdata;
++
++static u32 __init alt_inputs(u8 *buf)
++{
++	u32 n = 0;
++	/*
++	 * Whether this boot takes the LOCK prefixes out (an SMP kernel with
++	 * one CPU): an image pre-patched on one CPU must not run that way on
++	 * several.
++	 */
++	u8 uniproc = IS_ENABLED(CONFIG_SMP) && !noreplace_smp &&
++		     (num_present_cpus() == 1 || setup_max_cpus <= 1);
++
++#define ALT_INPUT(x) do { memcpy(buf + n, &(x), sizeof(x)); n += sizeof(x); } while (0)
++	BUILD_BUG_ON(sizeof(alt_cpuid) + sizeof(boot_cpu_data.x86_capability) +
++		     sizeof(x86_return_thunk) + 1 +
++		     (IS_ENABLED(CONFIG_PARAVIRT) ? sizeof(pv_ops) : 0) > ALT_INPUTS_MAX);
++	ALT_INPUT(alt_cpuid);	/* first: alt_prepatch_early() compares it alone */
++	ALT_INPUT(boot_cpu_data.x86_capability);
++	ALT_INPUT(x86_return_thunk);
++	ALT_INPUT(uniproc);
++#ifdef CONFIG_PARAVIRT
++	ALT_INPUT(pv_ops);
++#endif
++#undef ALT_INPUT
++	return n;
++}
++
++static bool __init alt_in_text(unsigned long a, unsigned long len)
++{
++	unsigned long end = a + len;
++
++	return end > a &&
++	       ((a >= (unsigned long)_text && end <= (unsigned long)_etext) ||
++		(a >= (unsigned long)_sinittext && end <= (unsigned long)_einittext));
++}
++
++/*
++ * Put the compiled bytes back. Returns false, having written nothing, if
++ * the table is malformed. @early: called from alt_prepatch_early(), where
++ * text_poke_early() can't be used (its sync_core() is an alternative
++ * itself): plain stores, then CPUID to serialize.
++ */
++static bool __init alt_undo(bool early)
++{
++	const u8 *start = alt_prepatch.undo;
++	const u8 *end = start + min_t(u32, alt_prepatch.undo_len, ALT_UNDO_MAX);
++
++	/* Check the whole table first, then write. */
++	for (int apply = 0; apply < 2; apply++) {
++		const u8 *p = start;
++
++		while (p < end) {
++			u8 *dst;
++			s32 off;
++			u16 len;
++
++			if (end - p < 6)
++				return false;
++			memcpy(&off, p, 4);
++			memcpy(&len, p + 4, 2);
++			p += 6;
++			if ((end - p) / 2 < len ||
++			    !alt_in_text((unsigned long)_text + off, len))
++				return false;
++			dst = _text + off;
++			if (apply && !memcmp(dst, p + len, len)) {
++				if (early) {
++					/* Volatile stores: no memcpy() call, it is pre-patched too. */
++					for (u16 i = 0; i < len; i++)
++						WRITE_ONCE(dst[i], p[i]);
++				} else {
++					text_poke_early(dst, p, len);
++				}
++			}
++			p += 2 * len;
++		}
++	}
++	if (early) {
++		u32 a = 0, b, c = 0, d;
++
++		native_cpuid(&a, &b, &c, &d);
++	}
++	return true;
++}
++
++/*
++ * The first thing x86_64_start_kernel() does: no pre-patched site has run
++ * yet. Record the CPUID leaves the inputs start with; if this image was
++ * pre-patched on a CPU that answers them differently, put the compiled
++ * text back now. Only CPUID, plain loads and stores, and calls to functions
++ * without alternatives (memcmp(), alt_undo()) run here, so this is safe on
++ * any CPU. Returns, like every function here, through the pre-patched
++ * return thunk: plain code on every CPU.
++ */
++void __init alt_prepatch_early(void)
++{
++	for (unsigned int i = 0; i < ARRAY_SIZE(alt_cpuid_leaves); i++) {
++		u32 *r = alt_cpuid[i];
++
++		r[0] = alt_cpuid_leaves[i][0];
++		r[2] = alt_cpuid_leaves[i][1];
++		native_cpuid(&r[0], &r[1], &r[2], &r[3]);
++	}
++	if (alt_prepatch.magic != ALT_PREPATCH_MAGIC)
++		return;
++	if (alt_prepatch.inputs_len >= sizeof(alt_cpuid) &&
++	    !memcmp(alt_prepatch.inputs, alt_cpuid, sizeof(alt_cpuid)))
++		return;
++	/* Too early to panic: alternative_instructions() does. */
++	if (alt_undo(true))
++		alt_restored = true;
++	else
++		alt_undo_bad = true;
++}
++
++static void __init alt_snapshot_stop(const char *when)
++{
++	/* A halted vCPU with interrupts off never leaves WHP: use the port. */
++	pr_info("snapshot point %s patching reached, stopping\n", when);
++	local_irq_disable();
++	outb(0x53, 0x701);
++	for (;;)
++		native_halt();
++}
++
+ void __init alternative_instructions(void)
+ {
++	static u8 inputs[ALT_INPUTS_MAX] __initdata;
++	bool have = alt_prepatch.magic == ALT_PREPATCH_MAGIC;
++	bool prepatched = false;
++	u32 ninputs;
+ 	u64 ibt;
+ 
+ 	int3_selftest();
+@@ -2522,36 +2732,58 @@
+ 	 */
+ 	paravirt_set_cap();
+ 
++	ninputs = alt_inputs(inputs);
++	if (have && !alt_restored && alt_prepatch_supported() &&
++	    alt_prepatch.inputs_len == ninputs &&
++	    !memcmp(alt_prepatch.inputs, inputs, ninputs))
++		prepatched = true;
++	if (alt_snapshot == ALT_SNAP_BEFORE)
++		alt_snapshot_stop("before");
++
+ 	/* Keep CET-IBT disabled until caller/callee are patched */
+ 	ibt = ibt_save(/*disable*/ true);
+ 
+ 	text_poke_early_batch = true;
+ 
+-	__apply_fineibt(__retpoline_sites, __retpoline_sites_end,
+-			__cfi_sites, __cfi_sites_end, true);
++	if (alt_undo_bad || (have && !prepatched && !alt_restored && !alt_undo(false)))
++		panic("alternatives: corrupt undo table in pre-patched image");
++	if (have)
++		pr_info("image pre-patched, %s\n",
++			prepatched ? "inputs match, not patching" :
++			alt_restored ? "for another CPU, compiled text restored at boot" :
++				       "inputs differ, compiled text restored");
++
++	if (!prepatched) {
++		__apply_fineibt(__retpoline_sites, __retpoline_sites_end,
++				__cfi_sites, __cfi_sites_end, true);
++	}
+ 	cfi_debug = false;
+ 
+ 	/*
+ 	 * Rewrite the retpolines, must be done before alternatives since
+ 	 * those can rewrite the retpoline thunks.
+ 	 */
+-	apply_retpolines(__retpoline_sites, __retpoline_sites_end);
+-	apply_returns(__return_sites, __return_sites_end);
++	if (!prepatched) {
++		apply_retpolines(__retpoline_sites, __retpoline_sites_end);
++		apply_returns(__return_sites, __return_sites_end);
++	}
+ 
+ 	its_fini_core();
+ 
+-	/*
+-	 * Adjust all CALL instructions to point to func()-10, including
+-	 * those in .altinstr_replacement.
+-	 */
+-	callthunks_patch_builtin_calls();
+-
+-	apply_alternatives(__alt_instructions, __alt_instructions_end);
+-
+-	/*
+-	 * Seal all functions that do not have their address taken.
+-	 */
+-	apply_seal_endbr(__ibt_endbr_seal, __ibt_endbr_seal_end);
++	if (!prepatched) {
++		/*
++		 * Adjust all CALL instructions to point to func()-10, including
++		 * those in .altinstr_replacement.
++		 */
++		callthunks_patch_builtin_calls();
++
++		apply_alternatives(__alt_instructions, __alt_instructions_end);
++
++		/*
++		 * Seal all functions that do not have their address taken.
++		 */
++		apply_seal_endbr(__ibt_endbr_seal, __ibt_endbr_seal_end);
++	}
+ 
+ 	text_poke_early_batch = false;
+ 	sync_core();
+@@ -2578,6 +2810,15 @@
+ 	alternatives_patched = 1;
+ 
+ 	alt_reloc_selftest();
++
++	if (alt_snapshot == ALT_SNAP_AFTER) {
++		/* Inputs only for a fresh image: 0 tells the tool "can't". */
++		if (!have) {
++			alt_prepatch.inputs_len = alt_prepatch_supported() ? ninputs : 0;
++			memcpy(alt_prepatch.inputs, inputs, ninputs);
++		}
++		alt_snapshot_stop("after");
++	}
+ }
+ 
+ /**
+--- a/arch/x86/kernel/head64.c	2026-11-04 22:19:13.510588781 +0000
++++ b/arch/x86/kernel/head64.c	2026-11-04 22:21:23.870586687 +0000
+@@ -42,6 +42,7 @@
+ #include <asm/sev.h>
+ #include <asm/tdx.h>
+ #include <asm/init.h>
++#include <asm/alternative.h>
+ 
+ /*
+  * Manage page tables very early on.
+@@ -244,6 +245,9 @@
+ 				(__START_KERNEL & PGDIR_MASK)));
+ 	BUILD_BUG_ON(__fix_to_virt(__end_of_fixed_addresses) <= MODULES_END);
+ 
++	/* Before any pre-patched text runs (patch 0026). */
++	alt_prepatch_early();
++
+ 	cr4_init_shadow();
+ 
+ 	/* Kill off the identity-map trampoline */

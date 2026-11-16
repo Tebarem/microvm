@@ -1,0 +1,234 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only token: nothing here pushes, comments or publishes.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Guest kernel version for the KVM job (guest/kernel/build.sh default).
+  KVER: 6.18.60
+
+jobs:
+  # ---- 1. Linux, gcc, Release, warnings as errors --------------------------
+  # Without /dev/kvm and without a guest kernel the hypervisor tests are not
+  # registered or exit 77 (skipped); `hello` is excluded here explicitly.
+  linux:
+    name: Linux (gcc, Release)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The project sets C_STANDARD 23 and links -static-pie: gcc 13 (Ubuntu
+      # 24.04) supports both. cmake_minimum_required(3.25) enforces the cmake
+      # version; the 24.04 package is 3.28.
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake gcc
+          cmake --version
+          gcc --version
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMICROVM_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -E '^hello$'
+
+  # ---- 2. Linux, AddressSanitizer + UBSan ----------------------------------
+  linux-sanitize:
+    name: Linux (ASan + UBSan, Debug)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # UBSan only reports by default; make a report fail the test.
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake gcc
+          cmake --version
+          gcc --version
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug -DMICROVM_SANITIZE=ON -DMICROVM_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -E '^hello$'
+
+  # ---- 3. Fuzz smoke: each harness for 30 s under ASan + UBSan --------------
+  # tests/fuzz/driver.c mutates the built-in seeds with -runs=N -seed=S and has
+  # no time limit, so timeout(1) ends each run. Exit 124 means the budget ran
+  # out with no crash; any other status is a finding. The seed is the run id,
+  # so a failure is reproduced with the same -seed and MVM_FUZZ_SAVE=1, which
+  # writes the current input to fuzz-crash.bin in the working directory.
+  fuzz:
+    name: Fuzz smoke (30 s per target)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake gcc
+          cmake --version
+          gcc --version
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug -DMICROVM_SANITIZE=ON -DMICROVM_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run fuzz targets
+        run: |
+          root=$PWD
+          count=0
+          fail=0
+          for f in build/fuzz_*; do
+            [ -f "$f" ] && [ -x "$f" ] || continue
+            count=$((count + 1))
+            name=$(basename "$f")
+            mkdir -p "fuzz-out/$name"
+            echo "::group::$name -seed=$GITHUB_RUN_ID"
+            rc=0
+            (cd "fuzz-out/$name" && timeout 30 "$root/$f" -runs=1000000000 -seed="$GITHUB_RUN_ID") || rc=$?
+            echo "::endgroup::"
+            if [ "$rc" -ne 124 ] && [ "$rc" -ne 0 ]; then
+              echo "::error::$name exited with status $rc (rerun with -seed=$GITHUB_RUN_ID and MVM_FUZZ_SAVE=1)"
+              fail=1
+            fi
+          done
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no fuzz_* targets were built"
+            exit 1
+          fi
+          echo "$count fuzz targets run"
+          exit "$fail"
+
+      - name: Keep crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-out
+          path: fuzz-out/
+          if-no-files-found: ignore
+
+  # ---- 4. Windows, MinGW-w64 (gcc + winhvplatform) --------------------------
+  # CMakeLists.txt links -static and the WinHv libraries with the GCC-only flags
+  # (-fcf-protection, -ftrivial-auto-var-init), so the toolchain is MinGW-w64
+  # from MSYS2, not MSVC. No hypervisor on the runner: `hello` is excluded.
+  windows:
+    name: Windows (MinGW-w64, Release)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Configure
+        run: |
+          gcc --version
+          cmake --version
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMICROVM_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -E '^hello$'
+
+  # ---- 5. Linux with /dev/kvm and a guest kernel --------------------------
+  # Builds the guest kernel (guest/kernel/build.sh: vmlinux, the SMP variant,
+  # and the test layer) and runs every suite, including the KVM ones. The
+  # kernel build takes a while, so its output is cached by KVER and by the
+  # files that define it; on a cache hit only the VMM is built.
+  linux-kvm:
+    name: Linux (KVM, guest kernel)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain and kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake gcc bc bison flex libelf-dev libssl-dev
+          cmake --version
+          gcc --version
+
+      - name: Restore guest kernel
+        id: kernel-cache
+        uses: actions/cache@v4
+        with:
+          path: guest/kernel/out
+          key: guest-kernel-${{ env.KVER }}-${{ hashFiles('guest/kernel/build.sh', 'guest/kernel/*.py', 'guest/kernel/*.fragment', 'guest/kernel/patches/**', 'guest/init/**', 'guest/rootfs-test/**') }}
+
+      - name: Build guest kernel
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
+        run: |
+          # Not executable in git (mode 100644): run through bash.
+          bash guest/kernel/build.sh
+          VARIANT=smp bash guest/kernel/build.sh
+
+      - name: Enable /dev/kvm for the runner
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            ls -l /dev/kvm
+          else
+            echo "::warning::/dev/kvm is not usable here; the KVM suites will be skipped (exit 77)"
+          fi
+          ls -l guest/kernel/out
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMICROVM_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

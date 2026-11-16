@@ -1,0 +1,29 @@
+From: microvm <microvm@localhost>
+Subject: [PATCH] x86/cpuid: stop the hypervisor signature scan at an empty range
+
+cpuid_base_hypervisor() probes all 256 ranges from 0x40000000 to
+0x4000ff00 looking for a signature. Under a hypervisor every CPUID is a
+round trip through it, so a KVM_GUEST kernel booting on Hyper-V pays 256
+of them in kvm_cpuid_base(). Hypervisors stack their interfaces in
+consecutive ranges, so stop at the first empty one after 0x40000000.
+
+--- a/arch/x86/include/asm/cpuid/api.h	2026-11-04 07:44:53.660121919 +0100
++++ b/arch/x86/include/asm/cpuid/api.h	2026-11-04 07:44:53.672120309 +0100
+@@ -199,6 +199,17 @@
+ 		cpuid(base, &eax, &signature[0], &signature[1], &signature[2]);
+ 
+ 		/*
++		 * Hypervisors stack their interfaces in consecutive ranges
++		 * (Hyper-V at 0x40000000, KVM or Xen at 0x40000100). Stop at
++		 * the first empty range after the first one instead of
++		 * probing all 256: each probe is a round trip through the
++		 * hypervisor.
++		 */
++		if (base != 0x40000000 && !eax && !signature[0] &&
++		    !signature[1] && !signature[2])
++			break;
++
++		/*
+ 		 * This must not compile to "call memcmp" because it's called
+ 		 * from PVH early boot code before instrumentation is set up
+ 		 * and memcmp() itself may be instrumented.

@@ -1,0 +1,32 @@
+Subject: [PATCH] static_call: don't re-sort sites that are already sorted
+
+static_call_init() heapsorts .static_call_sites by key on every boot.
+Heapsort does O(n log n) compare and swap callbacks even on sorted input,
+and each is an indirect call through a retpoline in a mitigated kernel.
+
+Check the order first and sort only if it is wrong. Our build sorts
+vmlinux's table (guest/kernel/prepatch.py), so the check is all a boot
+pays. An unsorted table (any other build, modules) is sorted as before.
+
+--- a/kernel/static_call_inline.c	2026-10-30 13:06:41.000000000 +0100
++++ b/kernel/static_call_inline.c	2026-11-04 09:47:13.640757545 +0100
+@@ -106,6 +106,19 @@
+ static inline void static_call_sort_entries(struct static_call_site *start,
+ 					    struct static_call_site *stop)
+ {
++	struct static_call_site *site;
++
++	/*
++	 * The build may have sorted vmlinux's sites already
++	 * (guest/kernel/prepatch.py): a linear check is far cheaper than a
++	 * heapsort, which does O(n log n) indirect calls even on sorted input.
++	 */
++	for (site = start + 1; site < stop; site++)
++		if (static_call_key(site - 1) > static_call_key(site))
++			break;
++	if (site >= stop)
++		return;
++
+ 	sort(start, stop - start, sizeof(struct static_call_site),
+ 	     static_call_site_cmp, static_call_site_swap);
+ }

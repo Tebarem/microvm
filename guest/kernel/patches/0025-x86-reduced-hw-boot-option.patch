@@ -1,0 +1,43 @@
+Subject: [PATCH] x86: "reduced_hw" boot option for platforms without PIT and PIC
+
+A hardware-reduced ACPI platform tells the kernel there is no 8254 PIT or
+8259 PIC, and acpi_generic_reduced_hw_init() then skips stopping the PIT,
+the ISA IRQ setup and the PIC probe. A microVM booted without ACPI has no
+way to say the same, so the kernel writes four PIT ports and probes the
+PIC: seven port I/O exits to the VMM for hardware it doesn't emulate.
+
+Add an early "reduced_hw" option that applies the same three overrides.
+The VMM passes it; it is only correct where the local APIC timer works
+without PIT calibration, as on a hardware-reduced ACPI platform.
+
+--- a/arch/x86/kernel/x86_init.c	2026-10-30 13:06:41.000000000 +0100
++++ b/arch/x86/kernel/x86_init.c	2026-11-04 10:06:50.374621893 +0100
+@@ -28,6 +28,7 @@
+ #include <asm/mach_traps.h>
+ #include <asm/irqdomain.h>
+ #include <asm/realmode.h>
++#include <asm/i8259.h>
+ 
+ void x86_init_noop(void) { }
+ void __init x86_init_uint_noop(unsigned int unused) { }
+@@ -175,3 +176,20 @@
+ 	.io_apic_read	= native_io_apic_read,
+ 	.restore	= native_restore_boot_irq_mode,
+ };
++
++/*
++ * "reduced_hw": the platform has no PC legacy timer or interrupt hardware
++ * (8254 PIT, 8259 PIC), like a hardware-reduced ACPI platform, but boots
++ * without ACPI to say so. A VMM that emulates neither passes this, and the
++ * kernel applies the same overrides as acpi_generic_reduced_hw_init(): it
++ * neither stops a PIT nor probes for a PIC that isn't there. The local APIC
++ * timer must be usable without PIT calibration (known frequency).
++ */
++static int __init parse_reduced_hw(char *arg)
++{
++	x86_init.timers.timer_init	= x86_init_noop;
++	x86_init.irqs.pre_vector_init	= x86_init_noop;
++	legacy_pic			= &null_legacy_pic;
++	return 0;
++}
++early_param("reduced_hw", parse_reduced_hw);

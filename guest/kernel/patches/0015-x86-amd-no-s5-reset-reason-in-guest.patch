@@ -1,0 +1,25 @@
+From: microvm <microvm@localhost>
+Subject: [PATCH] x86/CPU/AMD: don't read the S5 reset reason in a guest
+
+print_s5_reset_status_mmio() maps the FCH power-management registers and
+reads the previous reset reason. A guest has no FCH: the access is an MMIO
+exit to the hypervisor, which can only answer with all-ones, and the
+ioremap()/iounmap() pair costs a vmap purge on top. Skip it when running
+under a hypervisor.
+
+--- a/arch/x86/kernel/cpu/amd.c	2026-10-30 13:06:41.000000000 +0100
++++ b/arch/x86/kernel/cpu/amd.c	2026-11-04 08:38:25.849806394 +0100
+@@ -1367,6 +1367,13 @@
+ 	if (!cpu_feature_enabled(X86_FEATURE_ZEN))
+ 		return 0;
+ 
++	/*
++	 * A guest has no FCH: the read traps to the hypervisor, which has no
++	 * reset reason to give.
++	 */
++	if (cpu_feature_enabled(X86_FEATURE_HYPERVISOR))
++		return 0;
++
+ 	addr = ioremap(FCH_PM_BASE + FCH_PM_S5_RESET_STATUS, sizeof(value));
+ 	if (!addr)
+ 		return 0;

@@ -1,0 +1,105 @@
+Subject: [PATCH] iomap: don't allocate write-path reserves at boot
+
+Every boot with FS_IOMAP allocates, and so touches:
+  - two writeback biosets with 4 * (PAGE_SIZE / SECTOR_SIZE) = 32 reserved
+    bios each, each bio with a BIO_MAX_VECS (4 KiB) bvec array: ~260 KiB;
+  - a zeroed 64 KiB page for sub-block direct-I/O zeroing.
+In a microVM whose only iomap user is a read-only EROFS root, none of it
+is ever used, and it's a large part of what a VM costs in memory and of
+the time the fs initcalls take (each page is a first touch for the host).
+
+Size the ioend pools like fs_bio_set (BIO_POOL_SIZE): a mempool reserve
+is only drawn on once the slab allocator fails, and a single element
+already guarantees forward progress. Allocate the zero page on first use
+in iomap_dio_zero(), which can already fail and whose callers handle it.
+
+--- a/fs/iomap/direct-io.c	2026-10-30 13:06:41.000000000 +0100
++++ b/fs/iomap/direct-io.c	2026-11-04 12:28:22.917316882 +0100
+@@ -31,6 +31,26 @@
+ #define IOMAP_ZERO_PAGE_ORDER (get_order(IOMAP_ZERO_PAGE_SIZE))
+ static struct page *zero_page;
+ 
++/*
++ * Allocated on first use: only direct writes that don't cover whole blocks
++ * need it, and a kernel whose iomap users are read-only never does.
++ */
++static struct page *iomap_dio_zero_page(void)
++{
++	struct page *page = smp_load_acquire(&zero_page);
++
++	if (page)
++		return page;
++	page = alloc_pages(GFP_KERNEL | __GFP_ZERO, IOMAP_ZERO_PAGE_ORDER);
++	if (!page)
++		return NULL;
++	if (cmpxchg(&zero_page, NULL, page)) {
++		__free_pages(page, IOMAP_ZERO_PAGE_ORDER);
++		page = smp_load_acquire(&zero_page);
++	}
++	return page;
++}
++
+ struct iomap_dio {
+ 	struct kiocb		*iocb;
+ 	const struct iomap_dio_ops *dops;
+@@ -295,6 +315,7 @@
+ 		loff_t pos, unsigned len)
+ {
+ 	struct inode *inode = file_inode(dio->iocb->ki_filp);
++	struct page *zero;
+ 	struct bio *bio;
+ 
+ 	if (!len)
+@@ -304,6 +325,9 @@
+ 	 */
+ 	if (WARN_ON_ONCE(len > IOMAP_ZERO_PAGE_SIZE))
+ 		return -EINVAL;
++	zero = iomap_dio_zero_page();
++	if (!zero)
++		return -ENOMEM;
+ 
+ 	bio = iomap_dio_alloc_bio(iter, dio, 1, REQ_OP_WRITE | REQ_SYNC | REQ_IDLE);
+ 	fscrypt_set_bio_crypt_ctx(bio, inode, pos >> inode->i_blkbits,
+@@ -312,7 +336,7 @@
+ 	bio->bi_private = dio;
+ 	bio->bi_end_io = iomap_dio_bio_end_io;
+ 
+-	__bio_add_page(bio, zero_page, len, 0);
++	__bio_add_page(bio, zero, len, 0);
+ 	iomap_dio_submit_bio(iter, dio, bio, pos);
+ 	return 0;
+ }
+@@ -841,15 +865,3 @@
+ 	return iomap_dio_complete(dio);
+ }
+ EXPORT_SYMBOL_GPL(iomap_dio_rw);
+-
+-static int __init iomap_dio_init(void)
+-{
+-	zero_page = alloc_pages(GFP_KERNEL | __GFP_ZERO,
+-				IOMAP_ZERO_PAGE_ORDER);
+-
+-	if (!zero_page)
+-		return -ENOMEM;
+-
+-	return 0;
+-}
+-fs_initcall(iomap_dio_init);
+--- a/fs/iomap/ioend.c	2026-10-30 13:06:41.000000000 +0100
++++ b/fs/iomap/ioend.c	2026-11-04 12:28:22.917316882 +0100
+@@ -434,7 +434,14 @@
+ 
+ static int __init iomap_ioend_init(void)
+ {
+-	const unsigned int nr_mempool_entries = 4 * (PAGE_SIZE / SECTOR_SIZE);
++	/*
++	 * A mempool's reserve only matters once the slab allocator fails,
++	 * and one bio guarantees forward progress; keep the block layer's
++	 * own reserve (fs_bio_set) rather than 32 bios with 4 KiB bvec
++	 * arrays per set, which every boot allocates and touches even when
++	 * nothing writes back through iomap.
++	 */
++	const unsigned int nr_mempool_entries = BIO_POOL_SIZE;
+ 	int error;
+ 
+ 	error = bioset_init(&iomap_ioend_bioset, nr_mempool_entries,

@@ -1,0 +1,24 @@
+Subject: [PATCH] ipconfig: don't sleep 10 ms for a static address
+
+ip_auto_config() sleeps CONF_POST_OPEN (10 ms, two jiffies at HZ=100)
+after opening the devices, to "give drivers a chance to settle" before
+BOOTP/DHCP/RARP talk through them. With a complete static configuration
+on a single device (ip=ADDR::GW:MASK::DEV:off) nothing is sent, so the
+sleep only delays boot: on microvm it would be ten times the whole boot.
+
+--- a/net/ipv4/ipconfig.c	2026-11-04 19:18:08.272655097 +0100
++++ b/net/ipv4/ipconfig.c	2026-11-04 19:18:08.288697761 +0100
+@@ -1517,8 +1517,11 @@
+ 	if (err)
+ 		return err;
+ 
+-	/* Give drivers a chance to settle */
+-	msleep(CONF_POST_OPEN);
++	/* Give drivers a chance to settle, unless nothing will be asked of
++	 * them: a static address on the only device.
++	 */
++	if (ic_myaddr == NONE || ic_first_dev->next)
++		msleep(CONF_POST_OPEN);
+ 
+ 	/*
+ 	 * If the config information is insufficient (e.g., our IP address or

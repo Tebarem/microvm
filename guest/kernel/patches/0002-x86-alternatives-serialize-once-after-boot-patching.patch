@@ -1,0 +1,60 @@
+From: microvm
+Subject: [PATCH] x86/alternatives: serialize once after boot-time patching
+
+alternative_instructions() rewrites ~12k sites in a minimal kernel
+(return thunks, retpolines, alternatives), and text_poke_early() runs
+sync_core() - an IRET-to-self without SERIALIZE - after every one. At
+that point only the boot CPU is up and NMIs are stopped, and x86 keeps
+instruction fetch coherent with the CPU's own stores, so a single
+sync_core() at the end is sufficient.
+
+Measured: ~18% of a 5.8 ms microVM boot was spent in text_poke_early().
+No mitigation is changed; the same bytes are written.
+
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -2374,6 +2374,15 @@
+ 	);
+ }
+ 
++/*
++ * Set while alternative_instructions() rewrites the core kernel. Only the
++ * boot CPU is up and NMIs are stopped, and x86 keeps instruction fetch
++ * coherent with stores made by the same CPU, so serializing after every
++ * site buys nothing: one sync_core() once all sites are written is enough.
++ * Saves one IRET-to-self per site (~12k in a minimal guest, ~1 ms).
++ */
++static bool text_poke_early_batch __read_mostly;
++
+ void __init alternative_instructions(void)
+ {
+ 	u64 ibt;
+@@ -2407,6 +2416,8 @@
+ 	/* Keep CET-IBT disabled until caller/callee are patched */
+ 	ibt = ibt_save(/*disable*/ true);
+ 
++	text_poke_early_batch = true;
++
+ 	__apply_fineibt(__retpoline_sites, __retpoline_sites_end,
+ 			__cfi_sites, __cfi_sites_end, true);
+ 	cfi_debug = false;
+@@ -2433,6 +2444,9 @@
+ 	 */
+ 	apply_seal_endbr(__ibt_endbr_seal, __ibt_endbr_seal_end);
+ 
++	text_poke_early_batch = false;
++	sync_core();
++
+ 	ibt_restore(ibt);
+ 
+ #ifdef CONFIG_SMP
+@@ -2485,7 +2499,8 @@
+ 	} else {
+ 		local_irq_save(flags);
+ 		memcpy(addr, opcode, len);
+-		sync_core();
++		if (!text_poke_early_batch)
++			sync_core();
+ 		local_irq_restore(flags);
+ 
+ 		/*

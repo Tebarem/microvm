@@ -1,0 +1,28 @@
+From: microvm <microvm@localhost>
+Subject: [PATCH] x86/sparsemem: use 32 MB memory sections
+
+memmap_init() initialises struct pages up to the end of the last memory
+section, past the end of RAM, because early sections are pfn_valid() for
+their whole span. With 128 MB sections a 64 MB guest touches 2 MB of
+memory map instead of 1 MB, and a 32 MB guest 2 MB instead of 0.5 MB.
+32 MB sections bound that waste at 0.5 MB; the price is a larger zeroed
+mem_section root table (64 KB instead of 16 KB with 4-level paging).
+
+--- a/arch/x86/include/asm/sparsemem.h	2026-11-04 07:47:26.616415183 +0100
++++ b/arch/x86/include/asm/sparsemem.h	2026-11-04 07:47:26.632247388 +0100
+@@ -25,7 +25,14 @@
+ #  define MAX_PHYSMEM_BITS	32
+ # endif
+ #else /* CONFIG_X86_32 */
+-# define SECTION_SIZE_BITS	27 /* matt - 128 is convenient right now */
++/*
++ * 32 MB sections: the memory map of the last section is initialised up to
++ * the section end even past the end of RAM, so 128 MB sections cost a
++ * 64 MB microVM 1 MB of struct pages it doesn't have. Smaller sections
++ * grow the zeroed mem_section root table instead (64 KB with 4-level
++ * paging).
++ */
++# define SECTION_SIZE_BITS	25
+ # define MAX_PHYSMEM_BITS	(pgtable_l5_enabled() ? 52 : 46)
+ #endif
+ 

@@ -1,0 +1,47 @@
+Subject: [PATCH] mm: inline struct page init into memmap_init_range
+
+memmap_init_range() calls __init_single_page() for every page of memory.
+The function is a dozen stores, and with a return thunk (the SRSO
+mitigation on AMD Zen) the call and return cost more than the stores.
+Inline it into the loop; other callers keep the out-of-line function.
+
+--- a/mm/mm_init.c	2026-10-30 13:06:41.000000000 +0100
++++ b/mm/mm_init.c	2026-11-04 10:59:06.902174720 +0100
+@@ -578,8 +578,13 @@
+ 	node_states[N_MEMORY] = saved_node_state;
+ }
+ 
+-void __meminit __init_single_page(struct page *page, unsigned long pfn,
+-				unsigned long zone, int nid)
++/*
++ * Inlined into memmap_init_range(), which calls it for every page of
++ * memory: a call and a return per page cost more than the page's stores
++ * on CPUs whose returns go through a return thunk.
++ */
++static __always_inline void init_single_page(struct page *page, unsigned long pfn,
++					     unsigned long zone, int nid)
+ {
+ 	mm_zero_struct_page(page);
+ 	set_page_links(page, zone, nid, pfn);
+@@ -596,6 +601,12 @@
+ #endif
+ }
+ 
++void __meminit __init_single_page(struct page *page, unsigned long pfn,
++				unsigned long zone, int nid)
++{
++	init_single_page(page, pfn, zone, nid);
++}
++
+ #ifdef CONFIG_NUMA
+ /*
+  * During memory init memblocks map pfns to nids. The search is expensive and
+@@ -931,7 +942,7 @@
+ 		}
+ 
+ 		page = pfn_to_page(pfn);
+-		__init_single_page(page, pfn, zone, nid);
++		init_single_page(page, pfn, zone, nid);
+ 		if (context == MEMINIT_HOTPLUG) {
+ #ifdef CONFIG_ZONE_DEVICE
+ 			if (zone == ZONE_DEVICE)

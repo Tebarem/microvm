@@ -1,0 +1,148 @@
+Subject: [PATCH] x86/mm/cpa: compute a 4k run's protections once
+
+0027 changes a run of 4k PTEs in one step but still runs the protection
+checks per page: static_protections() does four range checks and, for
+pages in the kernel text range, a full lookup_address() walk; that and
+the PTE rebuild were most of the remaining CPA time at boot.
+
+Make the run the PTEs that equal the first one but for a contiguous
+pfn and that fall into the same static protection ranges. Then every
+page of the run gets the same new protections, and static_protections()
+and verify_rwx() over the whole run give exactly the per-page answer:
+each check is an overlap with one range, and the one that depends on the
+mapping level (text RO) uses ranges aligned to large pages, so it is the
+same for every page of a page table.
+
+The PTEs of a run are then the first one's plus i pages (unless the new
+protections are PROT_NONE, which stores the pfn inverted), so only the
+first goes through pfn_pte().
+
+--- a/arch/x86/mm/pat/set_memory.c	2026-11-04 11:38:59.751682462 +0100
++++ b/arch/x86/mm/pat/set_memory.c	2026-11-04 11:38:59.795689565 +0100
+@@ -1870,6 +1870,20 @@
+ 	       __cpa_pfn_in_highmap(pfn) << 3;
+ }
+ 
++/*
++ * The part of static_protections() that can differ between the pages of one
++ * page table: pages that agree on it get the same answer for a run as each
++ * would alone, because each check is an overlap with one range.
++ * protect_kernel_text_ro() is left out: its range is aligned to large pages
++ * and its answer depends on the mapping level there, so it is the same for
++ * every page of a page table.
++ */
++static pgprotval_t cpa_static_class(unsigned long vaddr, unsigned long pfn)
++{
++	return protect_kernel_text(vaddr, vaddr + PAGE_SIZE - 1) |
++	       protect_pci_bios(pfn, pfn) | protect_rodata(pfn, pfn);
++}
++
+ static int __change_page_attr(struct cpa_data *cpa, int primary)
+ {
+ 	unsigned long address;
+@@ -1891,61 +1905,70 @@
+ 	if (level == PG_LEVEL_4K) {
+ 		unsigned long pfn0 = pte_pfn(old_pte), n = 1, i;
+ 		unsigned int class = cpa_alias_class(address, pfn0);
++		pgprotval_t sclass = cpa_static_class(address, pfn0);
++		pgprot_t old_prot, new_prot;
++		pte_t new_pte0;
++		bool inverted;
+ 
+ 		/*
+ 		 * The rest of this page table maps the pages that follow, so
+ 		 * change as many of them as the request covers here, instead
+-		 * of walking the page tables again for each. A run stops where
+-		 * the pfns stop being contiguous or the alias handling would
+-		 * differ: the caller processes the aliases of [pfn0, pfn0 + n)
++		 * of walking the page tables again for each. A run is the
++		 * PTEs that differ from the first only by a contiguous pfn and
++		 * that agree on the alias handling and the static protection
++		 * ranges: all of them get the same new protections, computed
++		 * once, and the caller processes the aliases of [pfn0, pfn0 + n)
+ 		 * as one range.
+ 		 */
+-		if (!(cpa->flags & (CPA_ARRAY | CPA_PAGES_ARRAY)))
++		if (!(cpa->flags & (CPA_ARRAY | CPA_PAGES_ARRAY)) && pte_present(old_pte))
+ 			n = min(cpa->numpages, PTRS_PER_PTE - pte_index(address));
++		for (i = 1; i < n; i++) {
++			unsigned long va = address + i * PAGE_SIZE;
+ 
+-		for (i = 0; i < n; i++, kpte++, address += PAGE_SIZE) {
+-			pte_t new_pte;
+-			pgprot_t old_prot, new_prot;
+-			unsigned long pfn;
+-
+-			if (i) {
+-				old_pte = *kpte;
+-				if (pte_none(old_pte) || pte_pfn(old_pte) != pfn0 + i ||
+-				    cpa_alias_class(address, pfn0 + i) != class)
+-					break;
+-			}
+-			old_prot = new_prot = pte_pgprot(old_pte);
+-			pfn = pte_pfn(old_pte);
++			if (pte_val(kpte[i]) != pte_val(old_pte) + (i << PAGE_SHIFT) ||
++			    cpa_alias_class(va, pfn0 + i) != class ||
++			    cpa_static_class(va, pfn0 + i) != sclass)
++				break;
++		}
++		n = i;
+ 
+-			pgprot_val(new_prot) &= ~pgprot_val(cpa->mask_clr);
+-			pgprot_val(new_prot) |= pgprot_val(cpa->mask_set);
++		old_prot = new_prot = pte_pgprot(old_pte);
++		pgprot_val(new_prot) &= ~pgprot_val(cpa->mask_clr);
++		pgprot_val(new_prot) |= pgprot_val(cpa->mask_set);
+ 
+-			cpa_inc_4k_install();
+-			/* Hand in lpsize = 0 to enforce the protection mechanism */
+-			new_prot = static_protections(new_prot, address, pfn, 1, 0,
+-						      CPA_PROTECT);
++		/* Hand in lpsize = 0 to enforce the protection mechanism */
++		new_prot = static_protections(new_prot, address, pfn0, n, 0,
++					      CPA_PROTECT);
+ 
+-			new_prot = verify_rwx(old_prot, new_prot, address, pfn, 1,
+-					      nx, rw);
++		new_prot = verify_rwx(old_prot, new_prot, address, pfn0, n,
++				      nx, rw);
+ 
+-			new_prot = pgprot_clear_protnone_bits(new_prot);
++		new_prot = pgprot_clear_protnone_bits(new_prot);
+ 
+-			/*
+-			 * We need to keep the pfn from the existing PTE,
+-			 * after all we're only going to change its attributes
+-			 * not the memory it points to
+-			 */
+-			new_pte = pfn_pte(pfn, new_prot);
++		/*
++		 * We need to keep the pfn from the existing PTE, after all
++		 * we're only going to change its attributes not the memory it
++		 * points to. Unless the new PTE is PROT_NONE (pfn stored
++		 * inverted), page i's is the first one's plus i pages.
++		 */
++		new_pte0 = pfn_pte(pfn0, new_prot);
++		inverted = protnone_mask(pgprot_val(new_prot)) != 0;
++		for (i = 0; i < n; i++) {
++			pte_t new_pte = !i ? new_pte0 :
++				inverted ? pfn_pte(pfn0 + i, new_prot) :
++				__pte(pte_val(new_pte0) + (i << PAGE_SHIFT));
++
++			cpa_inc_4k_install();
+ 			/*
+ 			 * Do we really change anything ?
+ 			 */
+-			if (pte_val(old_pte) != pte_val(new_pte)) {
+-				set_pte_atomic(kpte, new_pte);
++			if (pte_val(kpte[i]) != pte_val(new_pte)) {
++				set_pte_atomic(&kpte[i], new_pte);
+ 				cpa->flags |= CPA_FLUSHTLB;
+ 			}
+ 		}
+ 		cpa->pfn = pfn0;
+-		cpa->numpages = i;
++		cpa->numpages = n;
+ 		return 0;
+ 	}
+ 

@@ -1,0 +1,28 @@
+From: microvm <microvm@localhost>
+Subject: [PATCH] x86/ibt: don't seal ENDBRs on CPUs without IBT
+
+apply_seal_endbr() overwrites the ENDBR at the entry of every function
+whose address is never taken, so IBT faults on an indirect call to it. On
+a CPU without IBT, ENDBR and the poison are both NOPs and the rewrite has
+no effect, other than costing a text write per function at boot and
+dirtying most kernel text pages, which then can't stay shared between VMs
+that map the same kernel image. Skip it there. IBT is decided once at
+boot, so the ENDBRs can't need sealing later.
+
+--- a/arch/x86/kernel/alternative.c	2026-11-04 08:50:04.517998377 +0100
++++ b/arch/x86/kernel/alternative.c	2026-11-04 08:50:04.562802626 +0100
+@@ -1244,6 +1244,14 @@
+ {
+ 	s32 *s;
+ 
++	/*
++	 * Without IBT, ENDBR and its poison are both NOPs: sealing would only
++	 * rewrite (and dirty) the entry of every function never called
++	 * indirectly. IBT can't be turned on later.
++	 */
++	if (!cpu_feature_enabled(X86_FEATURE_IBT))
++		return;
++
+ 	for (s = start; s < end; s++) {
+ 		void *addr = (void *)s + *s;
+ 

@@ -1,0 +1,114 @@
+From: microvm
+Subject: [PATCH] mm/page_reporting: drain the per-CPU lists; vm.page_reporting_flush
+
+Free page reporting hands free memory back to the host (virtio-balloon's
+VIRTIO_BALLOON_F_REPORTING). Two changes for microvm's guests:
+
+- Each pass first drains the per-CPU free lists. Pages there are free,
+  but not in the free lists a pass walks, and after a large free they
+  hold tens of MiB (55 MiB of 200 freed, in a 512 MiB guest) that would
+  otherwise stay with the VM. A pass runs at most every 2 s, so the
+  lists refill at that rate at worst.
+
+- A pass is slow by design: it starts 2 s after a free, and reports at
+  most about a sixteenth of each free list before waiting another 2 s
+  ("about 30 seconds" for an idle system to report everything). That
+  suits a running VM. A VM about to be snapshotted needs all of it now:
+  memory it reported is left out of the snapshot. Writing to
+  /proc/sys/vm/page_reporting_flush runs a pass at once, with no budget,
+  and returns when it is done. Pages reported before are skipped as
+  usual, so a flush costs only what was freed since. A sysctl rather
+  than a module parameter: the guest's /sys is mounted read-only.
+
+--- a/mm/page_reporting.c
++++ b/mm/page_reporting.c
+@@ -7,6 +7,7 @@
+ #include <linux/module.h>
+ #include <linux/delay.h>
+ #include <linux/scatterlist.h>
++#include <linux/sysctl.h>
+ 
+ #include "page_reporting.h"
+ #include "internal.h"
+@@ -48,6 +49,8 @@
+ EXPORT_SYMBOL_GPL(page_reporting_order);
+ 
+ #define PAGE_REPORTING_DELAY	(2 * HZ)
++/* microvm: a flush is running: no budget per list (vm.page_reporting_flush) */
++static bool page_reporting_flushing;
+ static struct page_reporting_dev_info __rcu *pr_dev_info __read_mostly;
+ 
+ enum {
+@@ -191,7 +194,7 @@
+ 		 * state to indicate that we are requesting additional
+ 		 * processing and exit this list.
+ 		 */
+-		if (budget < 0) {
++		if (budget < 0 && !READ_ONCE(page_reporting_flushing)) {
+ 			atomic_set(&prdev->state, PAGE_REPORTING_REQUESTED);
+ 			next = page;
+ 			break;
+@@ -315,6 +318,14 @@
+ 	struct zone *zone;
+ 
+ 	/*
++	 * microvm: pages on the per-CPU free lists are free, but not in the
++	 * free lists a pass walks; after a large free they hold tens of MiB.
++	 * Drained here, before the state changes, so that the frees this
++	 * causes don't ask for another pass: this one reports them.
++	 */
++	drain_all_pages(NULL);
++
++	/*
+ 	 * Change the state to "Active" so that we can track if there is
+ 	 * anyone requests page reporting after we complete our pass. If
+ 	 * the state is not altered by the end of the pass we will switch
+@@ -349,6 +360,48 @@
+ }
+ 
+ static DEFINE_MUTEX(page_reporting_mutex);
++
++/*
++ * microvm: writing to /proc/sys/vm/page_reporting_flush reports every
++ * free page now, with neither the delay nor the per-list budget, and
++ * returns once that is done. A VM about to be snapshotted asks for it, so
++ * that the host leaves the VM's free memory out of the snapshot.
++ */
++static int page_reporting_flush_handler(const struct ctl_table *table, int write,
++					void *buffer, size_t *length, loff_t *ppos)
++{
++	struct page_reporting_dev_info *prdev;
++
++	if (!write)
++		return -EINVAL;
++	mutex_lock(&page_reporting_mutex);
++	prdev = rcu_dereference_protected(pr_dev_info,
++					  lockdep_is_held(&page_reporting_mutex));
++	if (prdev) {
++		WRITE_ONCE(page_reporting_flushing, true);
++		mod_delayed_work(system_freezable_wq, &prdev->work, 0);
++		flush_delayed_work(&prdev->work);
++		WRITE_ONCE(page_reporting_flushing, false);
++	}
++	mutex_unlock(&page_reporting_mutex);
++	*ppos += *length;
++	return 0;
++}
++
++static const struct ctl_table page_reporting_sysctl[] = {
++	{
++		.procname	= "page_reporting_flush",
++		.mode		= 0200,
++		.proc_handler	= page_reporting_flush_handler,
++	},
++};
++
++static int __init page_reporting_sysctl_init(void)
++{
++	register_sysctl_init("vm", page_reporting_sysctl);
++	return 0;
++}
++subsys_initcall(page_reporting_sysctl_init);
+ DEFINE_STATIC_KEY_FALSE(page_reporting_enabled);
+ 
+ int page_reporting_register(struct page_reporting_dev_info *prdev)

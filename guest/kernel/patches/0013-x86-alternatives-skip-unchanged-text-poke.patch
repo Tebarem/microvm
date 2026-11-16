@@ -1,0 +1,26 @@
+From: microvm <microvm@localhost>
+Subject: [PATCH] x86/alternatives: don't rewrite unchanged text at boot
+
+text_poke_early() writes every site it is handed, then serializes the CPU
+with sync_core(). At boot many of those writes put back the bytes already
+there: alternatives that aren't applied and have no NOPs to merge. Compare
+first and return if nothing changes. The text page then stays clean too,
+which keeps it shareable when the kernel image is mapped copy-on-write.
+
+--- a/arch/x86/kernel/alternative.c	2026-11-04 08:36:06.254343186 +0100
++++ b/arch/x86/kernel/alternative.c	2026-11-04 08:36:06.290121121 +0100
+@@ -2534,6 +2534,14 @@
+ {
+ 	unsigned long flags;
+ 
++	/*
++	 * Many sites keep their bytes: an alternative that isn't applied and
++	 * has no NOPs to merge, a call that stays a call. Writing them anyway
++	 * costs a serializing sync_core() each and dirties the text page.
++	 */
++	if (!memcmp(addr, opcode, len))
++		return;
++
+ 	if (boot_cpu_has(X86_FEATURE_NX) &&
+ 	    is_module_text_address((unsigned long)addr)) {
+ 		/*

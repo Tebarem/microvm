@@ -1,0 +1,57 @@
+Subject: [PATCH] x86/mm: free init pages with one CPA pass, not two
+
+free_init_pages() makes the range non-executable and then writable with
+two set_memory_*() calls. Each call walks every page of the range (and its
+direct-map alias) and flushes the TLB.
+
+Add set_memory_rw_nx(), which sets both bits in one change_page_attr pass.
+The final PTEs are the same, and each PTE goes from its old protection
+straight to RW+NX, so there is still no moment where the range is
+writable and executable.
+
+--- a/arch/x86/include/asm/set_memory.h	2026-10-30 13:06:41.000000000 +0100
++++ b/arch/x86/include/asm/set_memory.h	2026-11-04 09:58:35.610249985 +0100
+@@ -8,6 +8,7 @@
+ 
+ #define set_memory_rox set_memory_rox
+ int set_memory_rox(unsigned long addr, int numpages);
++int set_memory_rw_nx(unsigned long addr, int numpages);
+ 
+ /*
+  * The set_memory_* API can be used to change various attributes of a virtual
+--- a/arch/x86/mm/pat/set_memory.c	2026-10-30 13:06:41.000000000 +0100
++++ b/arch/x86/mm/pat/set_memory.c	2026-11-04 09:58:35.610249985 +0100
+@@ -2392,6 +2392,21 @@
+ 	return change_page_attr_set(&addr, numpages, __pgprot(_PAGE_RW), 0);
+ }
+ 
++/*
++ * set_memory_nx() then set_memory_rw(), in one pass: one walk of the range
++ * and one TLB flush instead of two. Each PTE goes straight to RW+NX, so the
++ * range is never writable and executable at once.
++ */
++int set_memory_rw_nx(unsigned long addr, int numpages)
++{
++	pgprot_t set = __pgprot(_PAGE_RW);
++
++	if (__supported_pte_mask & _PAGE_NX)
++		set.pgprot |= _PAGE_NX;
++
++	return change_page_attr_set(&addr, numpages, set, 0);
++}
++
+ int set_memory_np(unsigned long addr, int numpages)
+ {
+ 	return change_page_attr_clear(&addr, numpages, __pgprot(_PAGE_PRESENT), 0);
+--- a/arch/x86/mm/init.c	2026-11-04 09:58:35.481880241 +0100
++++ b/arch/x86/mm/init.c	2026-11-04 09:58:35.610249985 +0100
+@@ -931,8 +931,7 @@
+ 		 * we are going to free part of that, we need to make that
+ 		 * writeable and non-executable first.
+ 		 */
+-		set_memory_nx(begin, (end - begin) >> PAGE_SHIFT);
+-		set_memory_rw(begin, (end - begin) >> PAGE_SHIFT);
++		set_memory_rw_nx(begin, (end - begin) >> PAGE_SHIFT);
+ 
+ 		/*
+ 		 * Poisoning writes every freed page: up to a few MB of

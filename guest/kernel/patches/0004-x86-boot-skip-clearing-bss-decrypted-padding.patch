@@ -1,0 +1,39 @@
+From: microvm <microvm@localhost>
+Subject: [PATCH] x86/boot: don't clear the padding in front of .bss..decrypted
+
+On x86-64 .bss..decrypted is PMD aligned, so .bss can end in up to 2 MB of
+padding no symbol lives in. clear_bss() zeroes it anyway, which makes a
+VMM back ~1 MB of guest memory per VM for nothing. Clear the regular .bss
+and the decrypted part separately and skip the gap.
+
+--- a/arch/x86/kernel/head64.c	2026-11-04 07:40:00.504273385 +0100
++++ b/arch/x86/kernel/head64.c	2026-11-04 07:40:00.543986391 +0100
+@@ -176,8 +176,17 @@
+    yet. */
+ void __init clear_bss(void)
+ {
++	extern char __bss_main_end[];
++
++	/*
++	 * .bss..decrypted is PMD aligned, which can leave up to 2 MB of
++	 * padding at the end of the regular .bss that nothing uses. Don't
++	 * write it: untouched guest pages cost the host nothing.
++	 */
+ 	memset(__bss_start, 0,
+-	       (unsigned long) __bss_stop - (unsigned long) __bss_start);
++	       (unsigned long) __bss_main_end - (unsigned long) __bss_start);
++	memset(__start_bss_decrypted, 0,
++	       (unsigned long) __bss_stop - (unsigned long) __start_bss_decrypted);
+ 	memset(__brk_base, 0,
+ 	       (unsigned long) __brk_limit - (unsigned long) __brk_base);
+ }
+--- a/arch/x86/kernel/vmlinux.lds.S	2026-11-04 07:40:00.508244685 +0100
++++ b/arch/x86/kernel/vmlinux.lds.S	2026-11-04 07:40:00.543986391 +0100
+@@ -368,6 +368,7 @@
+ 		*(.bss..page_aligned)
+ 		. = ALIGN(PAGE_SIZE);
+ 		*(BSS_MAIN)
++		__bss_main_end = .;
+ 		BSS_DECRYPTED
+ 		. = ALIGN(PAGE_SIZE);
+ 		__bss_stop = .;

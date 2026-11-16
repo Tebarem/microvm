@@ -1,0 +1,38 @@
+Subject: [PATCH] x86/e820: insert the non-busy ranges without PCI as well
+
+e820__reserve_resources() leaves persistent memory and soft-reserved
+ranges out of iomem_resource, for drivers to claim; they are inserted by
+e820__reserve_resources_late(), whose only caller (outside Hyper-V's
+Gen2 special case) is pcibios_resource_survey(). With CONFIG_PCI=n that
+never runs, so register_e820_pmem() finds no legacy PMEM resource and
+an e820 type-12 range never becomes /dev/pmemN.
+
+Call it from a subsys initcall when there's no PCI, which is the level
+pci_subsys_init() runs at, before the device initcalls that need it.
+
+--- a/arch/x86/kernel/e820.c	2026-10-30 13:06:41.000000000 +0100
++++ b/arch/x86/kernel/e820.c	2026-11-04 12:17:16.579145162 +0100
+@@ -1180,6 +1180,23 @@
+ 	}
+ }
+ 
++#ifndef CONFIG_PCI
++/*
++ * Without PCI nothing calls pcibios_resource_survey(), which is where the
++ * non-busy e820 ranges (legacy and ACPI persistent memory, soft-reserved)
++ * get into iomem_resource. register_e820_pmem() then finds no
++ * PERSISTENT_MEMORY_LEGACY resource and no /dev/pmemN appears. Insert
++ * them at the initcall level pci_subsys_init() would have used, ahead of
++ * the device initcalls that look for them.
++ */
++static int __init e820__reserve_resources_nopci(void)
++{
++	e820__reserve_resources_late();
++	return 0;
++}
++subsys_initcall(e820__reserve_resources_nopci);
++#endif
++
+ /*
+  * Pass the firmware (bootloader) E820 map to the kernel and process it:
+  */

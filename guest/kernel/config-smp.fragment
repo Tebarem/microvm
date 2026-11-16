@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT
+# On top of config.fragment: the kernel for VMs with several vCPUs
+# (VARIANT=smp guest/kernel/build.sh -> out/vmlinux-smp). Uniprocessor VMs
+# keep the smaller, faster-booting kernel built without SMP.
+CONFIG_SMP=y
+# The VMM's limit (MVM_MAX_VCPUS). Per-CPU data is sized by the CPUs the
+# MP table lists, not by this.
+CONFIG_NR_CPUS=8

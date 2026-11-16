@@ -1,0 +1,77 @@
+Subject: [PATCH] params: don't strlen() every table entry per boot option
+
+Each boot option is looked up in three tables: early __setup entries
+(do_early_param), kernel_params (parse_one) and, if unknown, all __setup
+entries again (obsolete_checksetup). parameq() measures the option once
+per entry, and obsolete_checksetup measures every __setup string, so a
+dozen options cost thousands of strlen() calls (~180 __setup entries in
+our config).
+
+Measure the option once per lookup, and match __setup prefixes
+character by character so a mismatch stops at the first differing byte.
+Matching is unchanged: same dash/underscore folding, same prefix rule.
+
+--- a/kernel/params.c	2026-10-30 13:06:41.000000000 +0100
++++ b/kernel/params.c	2026-11-04 09:42:56.711080924 +0100
+@@ -125,10 +125,12 @@
+ {
+ 	unsigned int i;
+ 	int err;
++	/* parameq() without a strlen() per table entry. */
++	const size_t len = strlen(param) + 1;
+ 
+ 	/* Find parameter */
+ 	for (i = 0; i < num_params; i++) {
+-		if (parameq(param, params[i].name)) {
++		if (parameqn(param, params[i].name, len)) {
+ 			if (params[i].level < min_level
+ 			    || params[i].level > max_level)
+ 				return 0;
+--- a/init/main.c	2026-10-30 13:06:41.000000000 +0100
++++ b/init/main.c	2026-11-04 09:42:56.711080924 +0100
+@@ -195,6 +195,21 @@
+ const char *envp_init[MAX_INIT_ENVS+2] = { "HOME=/", "TERM=linux", NULL, };
+ static const char *panic_later, *panic_param;
+ 
++/*
++ * parameqn(line, str, strlen(str)), but stopping at the first mismatch
++ * instead of measuring every __setup string for every boot option.
++ */
++static bool __init setup_prefix(const char *line, const char *str, size_t *len)
++{
++	size_t n;
++
++	for (n = 0; str[n]; n++)
++		if (!parameqn(line + n, str + n, 1))
++			return false;
++	*len = n;
++	return true;
++}
++
+ static bool __init obsolete_checksetup(char *line)
+ {
+ 	const struct obs_kernel_param *p;
+@@ -202,8 +217,8 @@
+ 
+ 	p = __setup_start;
+ 	do {
+-		int n = strlen(p->str);
+-		if (parameqn(line, p->str, n)) {
++		size_t n;
++		if (setup_prefix(line, p->str, &n)) {
+ 			if (p->early) {
+ 				/* Already done in parse_early_param?
+ 				 * (Needs exact match on param part).
+@@ -723,9 +738,11 @@
+ 				 const char *unused, void *arg)
+ {
+ 	const struct obs_kernel_param *p;
++	/* parameq() without a strlen() per __setup entry. */
++	const size_t len = strlen(param) + 1;
+ 
+ 	for (p = __setup_start; p < __setup_end; p++) {
+-		if (p->early && parameq(param, p->str)) {
++		if (p->early && parameqn(param, p->str, len)) {
+ 			if (p->setup_func(val) != 0)
+ 				pr_warn("Malformed early option '%s'\n", param);
+ 		}
