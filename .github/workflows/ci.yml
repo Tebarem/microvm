@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The project sets C_STANDARD 23 and links -static-pie: gcc 13 (Ubuntu
       # 24.04) supports both. cmake_minimum_required(3.25) enforces the cmake
@@ -66,7 +66,7 @@ jobs:
       # UBSan only reports by default; make a report fail the test.
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install toolchain
         run: |
@@ -106,7 +106,7 @@ jobs:
     env:
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install toolchain
         run: |
@@ -151,7 +151,7 @@ jobs:
 
       - name: Keep crash inputs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-out
           path: fuzz-out/
@@ -169,7 +169,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install MinGW-w64 toolchain
         uses: msys2/setup-msys2@v2
@@ -203,7 +203,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install toolchain and kernel build dependencies
         run: |
@@ -215,7 +215,7 @@ jobs:
 
       - name: Restore guest kernel
         id: kernel-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: guest/kernel/out
           key: guest-kernel-${{ env.KVER }}-${{ hashFiles('guest/kernel/build.sh', 'guest/kernel/*.py', 'guest/kernel/*.fragment', 'guest/kernel/patches/**', 'guest/init/**', 'guest/rootfs-test/**') }}
