@@ -659,6 +659,8 @@ int main(int argc, char **argv)
         }
         if (!strcmp(a, "--version")) {
             printf("microvm %s\n", MICROVM_VERSION);
+            free(env_files);
+            free(env_strs);
             return 0;
         }
         const bool has_val = i + 1 < argc;
@@ -751,13 +753,20 @@ int main(int argc, char **argv)
             prefault_mib = strtoull(argv[++i], nullptr, 10);
         else if (!strcmp(a, "--profile-us") && has_val)
             profile_us = (uint32_t)strtoul(argv[++i], nullptr, 10);
-        else usage();
+        else {
+            free(env_files);
+            free(env_strs);
+            usage();
+        }
     }
     if (!!kernel + hello + !!restore != 1 || (rootfs && hello) || (vsock_path && hello) || (net_on && hello) ||
         (balloon_on && hello) ||
         (restore ? cmd_at < argc || prefault_mib : cmd_at < argc && !rootfs) || (base && !restore) ||
-        (snapshot_diff && !snapshot))
+        (snapshot_diff && !snapshot)) {
+        free(env_files);
+        free(env_strs);
         usage();
+    }
     // The environment: read now (the files, the host's variables), served
     // to /init from memory (vm.c), with its length in front.
     static env_blob envb;
