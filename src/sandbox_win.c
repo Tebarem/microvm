@@ -1,4 +1,14 @@
 // SPDX-License-Identifier: MIT
+// SetProcessMitigationPolicy and the PROCESS_MITIGATION_* types are only
+// declared by MinGW's headers from Windows 8.1 (0x0602) up, and some policy
+// fields used below need Windows 10. Set this before any header is included.
+#ifndef _WIN32_WINNT
+#  define _WIN32_WINNT 0x0A00
+#elif _WIN32_WINNT < 0x0A00
+#  undef _WIN32_WINNT
+#  define _WIN32_WINNT 0x0A00
+#endif
+
 #include "sandbox.h"
 
 #include <stdio.h>
