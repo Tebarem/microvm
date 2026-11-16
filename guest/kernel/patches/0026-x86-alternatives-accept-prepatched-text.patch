@@ -83,7 +83,7 @@ pre-patched site has run, and the boot is that of a fresh image.
 + */
 +#define ALT_PREPATCH_MAGIC	0x3148435441505041ULL	/* "APPATCH1" */
 +#define ALT_INPUTS_MAX		1024
-+#define ALT_UNDO_MAX		(64 << 10)
++#define ALT_UNDO_MAX		(512 << 10)	/* keep in sync with prepatch.py */
 +
 +struct alt_prepatch {
 +	u64 magic;
