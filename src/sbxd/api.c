@@ -369,7 +369,7 @@ static bool spawn_vmm(sandbox *sb, const char *restore_from)
     char cg[600], cg_vm[700];
     if (sb->team[0] && !pool_ready(sb, cg, sizeof cg))
         return false;
-    char b_lower[TMPL_MAX_LOWER][700], j_lower[TMPL_MAX_LOWER][16];
+    char b_lower[TMPL_MAX_LOWER][700], j_lower[TMPL_MAX_LOWER][24]; // "/layer" + any uint32
     sb_dir(sb, dir, sizeof dir);
     if (!C.jail) {
         argv[k++] = C.vmm;
